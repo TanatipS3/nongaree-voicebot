@@ -1,0 +1,304 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+> **Start here:** read `HANDOFF.md` for the user's hard rules (SSO / auth / ports /
+> deployment are off-limits without asking), current work-in-progress state, environment
+> traps, and how to build without a local `node_modules`.
+
+@AGENTS.md
+
+## What this project is
+
+A Thai Revenue Department voice assistant named **Aree (อารี)**. It combines:
+- A **Python LiveKit agent** (`agent.py`) — STT/LLM/TTS pipeline, runs the LangGraph, publishes emotion + chat events over the LiveKit data channel
+- A **LangGraph/RAG backend** (`graph/`) — routing, hybrid retrieval, and two separate answer generators (spoken vs on-screen)
+- A **Next.js 16 frontend** — Aree avatar, LiveKit room connection, and a right-hand "detail panel" that renders the structured Markdown answer with `[n]` citations
+
+This checkout is **not a git repository** — no `git diff`, no history, no revert. Read files to confirm state before destructive edits. Platform is **Windows** (PowerShell); a Bash tool is also available, but `rg` is *not* on PATH (use the Grep tool).
+
+## Commands
+
+### Python agent
+```powershell
+.venv\Scripts\Activate.ps1        # bash/macOS: source .venv/bin/activate
+
+python agent.py download-files    # one-time: download Silero VAD model
+python agent.py dev               # run the agent worker
+```
+
+### Next.js frontend
+```powershell
+npm run dev       # next dev, port 3000 (Next reads PORT; VOICEBOT_PORT in .env is vestigial)
+npm run build     # production build
+npm run lint      # ESLint — no CI, no pytest; the Python checks are the scripts below
+```
+`node_modules` is deliberately **not** installed in this checkout. Don't `npm install` locally without asking. Verify inside Docker instead (`HANDOFF.md` §5), always with a throwaway tag:
+```bash
+# next build — the builder stage runs `npm ci && npm run build`
+docker build -f "docker container/Dockerfile" --target builder -t nongaree-verify:tmp .
+# tsc + eslint — the builder prunes devDeps, so use the deps stage with the source copied in
+docker build -f "docker container/Dockerfile" --target deps -t nongaree-deps:tmp .
+MSYS_NO_PATHCONV=1 docker run --rm -v "//e/Projects/RD/rd-nongaree/nongaree-voicebot:/repo:ro" -w /app nongaree-deps:tmp \
+  sh -c "cp -r /repo/app /repo/components /repo/lib /repo/proxy.ts /repo/eslint.config.mjs /repo/tsconfig.json /repo/next.config.ts /app/ && npx tsc --noEmit; npx eslint"
+```
+Expected lint result: 0 errors, 2 pre-existing `react-hooks/exhaustive-deps` warnings on `startResponseTimeout` (the user said leave them). For Python, `python -m py_compile agent.py` is the quick syntax gate. Remove the temp images afterwards.
+
+### Manual test / benchmark scripts (not pytest — run directly)
+```powershell
+python rag_node_test.py "เงินเดือนเท่าไหร่ถึงต้องเสียภาษี?"   # retrieve-node smoke test, isolated from the agent
+python local_bot_demo.py                                      # standalone browser demo (typed input, browser STT/TTS), no LiveKit
+python benchmark.py                                           # latency benchmark for LLM/STT/TTS/embedding endpoints
+python latency.py                                             # LatencyTracker helpers
+```
+`scripts/` holds one-off RAG benchmark / report / presentation generators (`run_*`, `compare_*`, `generate_*`) — supervisor-facing artifacts, not part of the runtime. Five scripts there are **durable and worth keeping**:
+- `scripts/multiturn_benchmark.py` — the multi-turn harness (13 conversations, 57 turns). Drives the real `compiled_graph` and the real `graph.conversation` memory code, asserting on routing and retrieval only. **Current reference: `reports/multiturn/s11-scenario-fixes-final.json` (57/57).** It calls the live LLM (the follow-up classifier) as well as Qdrant. It cannot see frontend turn state or the agent's turn lifecycle — see *Frontend turn state* below.
+- `scripts/test_conversation.py` — 84 offline checks: `graph/conversation.py` (turn recording, fact pinning, the compaction race), the follow-up classifier's parsing / gating / widening (no LLM call), the emotion-command false positives, canned-answer scope, plus parity of the emotion tables duplicated in `agent.py` / `graph/nodes.py`. No Qdrant, no LiveKit, no network.
+
+  Running them (use the venv Python; set `PYTHONIOENCODING=utf-8` in Bash or Thai output crashes the console):
+  ```powershell
+  python scripts/test_conversation.py          # all 84 checks, exit 1 on any failure — no per-test filter; comment out calls at the bottom to isolate one
+  python scripts/multiturn_benchmark.py --stage s12 --baseline reports/multiturn/s11-scenario-fixes-final.json
+  python scripts/multiturn_benchmark.py --stage adhoc --only salary_chain,reconnect          # a subset of conversations
+  python scripts/multiturn_benchmark.py --mode replay --transcript reports/multiturn/s11-scenario-fixes-final.json   # routing/retrieval only, pinned answers: deterministic and faster
+  ```
+  Conversation ids: `salary_chain`, `answer_carry`, `deduction_chain`, `form_code_chain`, `topic_switch`, `scope_bounce`, `long_followup`, `markerless_coref`, `long_session`, `unanswerable_guard`, `formcode_opener_guard`, `unlisted_followups`, `reconnect`. Each run writes `reports/multiturn/<stage>.json` and uses an isolated `MEMORY_DIR` under `reports/multiturn/.memory`. `--qdrant-url` overrides `QDRANT_URL`. The old flaky band is gone (`HANDOFF.md` §3e Fix 19), so **treat any failure as real**.
+- `scripts/threshold_sweep.py` — the evidence that `RAG_SCORE_THRESHOLD` must stay at 0.75. Run before anyone proposes changing it.
+- `scripts/reports.mjs` (problem-report admin CLI) and `scripts/mint-local-session.mjs` (local login page) — see below.
+
+## Environment setup
+
+There is **one `.env`** at the repo root (git-ignored; `.gitignore` whitelists `.env.example`, but no such file exists at root today — the shipped template is `docker container/.env.example`). Next.js 16 auto-loads `.env`, and the Python agent loads it via `python-dotenv`, so both processes share it — there is no `.env.local` in this tree. Docker uses `docker container/.env` + `docker container/.env.sso` instead (see below).
+
+Key variable groups:
+- **LiveKit**: `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`, `LIVEKIT_RESET_ROOM_ON_TOKEN`
+- **`AGENT_NAME`** — the worker/dispatch name. Read by *both* `agent.py` (`WorkerOptions.agent_name`) and `app/api/livekit/token/route.ts`. **A mismatch fails silently**: LiveKit creates a dispatch no worker serves and Aree just never joins the room. Defaults to `nongaree-agent` on both sides.
+- **Three OpenAI-compatible services**, each a `*_BASE_URL` / `*_API_KEY` / `*_MODEL` triple: `STT_`, `LLM_`, `TTS_` (all currently point at the same host). `TTS_VOICE` selects the voice.
+- **Per-node model overrides**: `ROUTER_MODEL`, `GENERATE_MODEL` (spoken answer), `TEXT_GENERATE_MODEL` (detail-panel answer) — each falls back to `LLM_MODEL`.
+- **RAG**: `RAG_ENABLED` (**default `true`**), `QDRANT_URL`, `QDRANT_COLLECTION` (`thai_tax_kb`), `QDRANT_API_KEY`, `EMBEDDING_BASE_URL/_API_KEY/_MODEL`, `RAG_TOP_K`, `RAG_SCORE_THRESHOLD`, `RAG_EXACT_MATCH_SCORE`.
+- **Routing / retrieval behaviour flags**: `ROUTER_USE_LLM` (default `false`), `OUT_OF_SCOPE_USE_LLM` (default `false`), `RETRIEVAL_CASCADE` (**default `true`**; `false` restores one-query-one-attempt and is how the benchmark measures legacy vs cascade), `FOLLOWUP_CLASSIFIER` (**default `true`**; `false` is the rollback switch for the LLM follow-up classifier), `FOLLOWUP_CLASSIFIER_MODEL` (defaults to `GENERATE_MODEL`), `FOLLOWUP_CLASSIFIER_TIMEOUT_S` (default `2.5`; on timeout routing falls back to keywords). Note `LLM_MODEL=ptm-minimax-2.5` returns **403** for the current key — harmless only because every getter has its own model variable.
+- **Problem reports**: `REPORT_DIR` (default `/data/reports`), `REPORT_ADMIN_TOKEN` (unset ⇒ the admin endpoint is disabled and 404s). **Deliberately left unset** — reports are still collected, and `scripts/reports.mjs` reads them off the volume without the token, so unset only disables the remote HTTP read path.
+- **Conversation memory**: `MEMORY_DIR` (default `/data/memory`), `MEMORY_TTL_MINUTES` (default 30, matching `IDLE_LIMIT_MS` in `VoiceRoom.tsx`). An unwritable `MEMORY_DIR` warns once and falls back to in-process memory rather than crashing.
+- **Frontend**: `NEXT_PUBLIC_SHOW_SESSION_HISTORY` (`"false"` hides the session-history rail).
+- **SSO (UAT)**: `APP_URL`, `SSO_KEY`, `SSO_SOAP_URL`, `SSO_NAMESPACE`, `SSO_APP_ID`, `SSO_SESSION_SECRET`, etc.
+
+## Architecture
+
+### Request flow (per turn — voice or typed)
+
+1. User speaks (LiveKit STT) **or** types (`{type:"text_input"}` on the data channel → `_text_input_queue`).
+2. `VoiceAgent.tts_node()` intercepts the pipeline, **discards** the default LLM/TTS text stream, and instead:
+   - `prepare_response_state()` runs `parallel_node` (routing + retrieval) once, then `send_sources()` publishes the retrieved chunks + per-turn diagnostics before any answer text streams.
+   - **Two answers are generated from the same state**, concurrently:
+     - **Spoken** (`stream_voice_answer` / `AREE_SYSTEM_PROMPT`): ≤4 lines, no Markdown, no English words, `[EMOTION:x]` prefix. Streamed sentence-by-sentence into `WavTTS`; each sentence's emotion is published just before its audio.
+     - **Detail panel** (`stream_text_answer` / `TEXT_SYSTEM_PROMPT`): structured Markdown (tables, bullets, calculation steps), screen-voice tone, **no** emotion tag. Streamed to the frontend as `chat_delta` / `chat_answer`.
+   - Long list/document answers are spoken as a short "see the right panel" handoff (`LIST_DETAIL_HANDOFF`); the full content only goes to the detail panel.
+3. The turn is recorded into conversation memory **as soon as the detail-panel answer is ready**, not after the last audio frame — see *Conversation memory* below. Past `MAX_WINDOW` the history is summarized in the background (`maybe_summarize`).
+
+### Conversation memory (`graph/conversation.py`, `graph/conversation_store.py`)
+
+Memory lives in `graph/`, not `agent.py`, so an offline harness can drive the *same* code — `agent.py` can't be imported without `livekit`. Four things are easy to get wrong:
+
+- **Recording is hung off the detail task, via `make_turn_recorder()`.** Both answer paths used to append only after the last audio frame played, so the turn was absent from `memory` for the whole spoken answer and a follow-up asked mid-answer was routed with an empty history (→ `out_of_scope`). Worse on the typed path: `_cancel_current_speech()` **cancels** `_process_text_and_speak`, so the tail append never ran and the turn was lost outright. The detail answer is what `append_turn` stores anyway (`detail or spoken`), it completes seconds before the audio, and a done-callback survives cancellation. The tail `record_turn(...)` call is a guarded fallback for a turn that produced speech but no panel answer — it is a no-op once the callback has fired.
+- **The user's numbers are pinned mechanically, not summarized.** `summarize_history` runs on `ROUTER_MODEL` (an 8B model, 3 sentences) and dropped figures like "80,000" most of the time. `extract_user_facts()` + `pin_facts()` add a `ข้อมูลที่ผู้ใช้ระบุ:` line **after** the LLM writes the summary, so it cannot drop them. Facts are **ranked, not truncated by recency** (keeping the newest 8 let incidental digits evict the turn-1 salary), deduped on **number + unit** (`ข้อ 3` was overwriting `ลูก 3 คน`), and known units are matched before a generic short-word fallback (Thai is unspaced, so a naive match on `100,000 บาทต้องจ่าย` yields `บาทต้อ`).
+- **Compaction runs in the background, so it must not assume history stood still.** `maybe_summarize()` awaits a multi-second LLM call; turns can be appended during it. It records **how many** entries it summarised (`cut`) and afterwards keeps `history[cut:]` — never a "recent" list sliced before the await, which silently dropped every turn asked mid-summary (numbers included, and from disk on the next save). If the history list was *replaced* during the wait it discards the summary instead. The background task is held in `_background_tasks` in `agent.py` because the event loop only keeps weak references to tasks. Covered by `test_compaction_race` (`HANDOFF.md` §3e Fix 26).
+- **Persistence is per user, keyed on the LiveKit room name** minus the `nongaree-` prefix (`conversation_store.room_to_key`). The token route derives the room server-side, so the key is sanitised and unspoofable — **don't switch it to `participant.identity`**, which is the raw username. Atomic write, 30-minute idle TTL matching `IDLE_LIMIT_MS`, and it degrades to in-process memory with a single warning if `MEMORY_DIR` is unwritable.
+
+`scripts/test_conversation.py` covers all of the above offline — no Qdrant, no LiveKit, no network.
+
+### The graph (`graph/graph.py`)
+
+`START → parallel → {generate | out_of_scope | curated} → END`. Only **one** node runs per turn.
+
+`parallel_node` decides the route, short-circuiting in order:
+1. `_manual_emotion_command()` — user asking Aree to *show* an emotion ("ทำหน้าเศร้า") → `curated` route with a canned line. **Matches only a message that IS a command, anchored end to end** — it used to fire on a command word + emotion word anywhere, so "จ้างฟรีแลนซ์ (บุคคลธรรมดา) ทำระบบ…" ("ทำ" + "ธรรมดา") became "กลับสู่อารมณ์ปกติ". The **same check runs in the browser** (`getManualEmotionCommand` in `VoiceRoom.tsx`) *before* a typed question is sent, so a false match there swallows the question entirely — keep the two equivalent (`scripts/test_conversation.py` asserts the alias lists match).
+2. `find_curated_answer()` (`graph/curated_answers.py`) — hand-written exact answers for fragile short-codes/forms (e.g. TCL) and simple calculators → `curated`. Two guards added 2026-09-14 after a supervisor scenario test: **`_covers()`** — each topic-specific canned answer declares the topics it covers (`_TOPIC_TERMS`) and is skipped if the question also mentions anything else, so a multi-part question ("ThaiESG + ประกันชีวิต", "ฟรีแลนซ์ + หักค่าใช้จ่าย", "…เปลี่ยนเป็นบริษัท") reaches retrieval instead of getting a partial answer; and **`_is_annual_salary()`** — the salary calculators assume a monthly figure (×12), so a yearly one ("เงินเดือนรวม / ทั้งปี / …บาทต่อปี") skips them. The yearly marker must sit on the salary amount: in "เงินเดือน 100,000 บาทต้องจ่ายภาษีปีละเท่าไหร่" the "ปีละ" belongs to the tax.
+3. `_fast_route()` — keyword/regex classifier (`rag` / `direct` / `out_of_scope`). This handles most traffic **without an LLM call**. Tax-form patterns, mixed alphanumeric codes, and English tax terms (see *English term aliases*) force `rag`. **First check of all** is `_is_provider_recommendation()` → `out_of_scope`: "which bank / which company / which fund is best" is not something RD answers at any confidence. It must run before the keyword lists, because `ประกันชีวิตบริษัทไหนดีที่สุด` contains "บริษัท", routes `rag`, and then retrieves at 0.82 — the score gate never gets a chance. Keyed on a **provider noun + "ไหน"**, never "ไหน" alone (`ต้องยื่นแบบไหน` — "which form" — is a good tax question).
+   **3b. LLM follow-up classifier** (`classify_followup`, `HANDOFF.md` §3e Fix 27). When `_fast_route` says `out_of_scope`, there is an earlier user question, the keyword follow-up rescue didn't fire, and it isn't a provider-recommendation question, one yes/no LLM call asks "does this depend on the previous turn?". **1** → route `rag` *and* set `state["is_followup"]`, which makes retrieval widen with the previous question even without an anaphora marker. **0, timeout (2.5s) or unparseable** → today's keyword behaviour. It is gated precisely so a normal tax question, a first question, or "which bank is best" never pays for an LLM call. Model is `GENERATE_MODEL` (ptm-oss-120b), **not** `ROUTER_MODEL`: measured, the 8B model was less accurate (11/14 vs 14/14) *and* twice as slow, because it always emits `<think>` first. **Classification, not rewriting** — an LLM rewrite of the same cases turned the weather question into the previous tax question.
+4. Only if `_fast_route` is inconclusive (or `ROUTER_USE_LLM=true`) does the **LLM router** (`router_node`) run, in parallel with retrieval; retrieval is cancelled if the router says non-RAG.
+
+Routes `direct` and `rag` both go to `generate_node` — the difference is whether `state["context"]` is populated. When `RAG_ENABLED=false`, retrieval is skipped entirely.
+
+**Three-way separation — read before touching the router.** `_fast_route()` returning `"out_of_scope"` is a **fallthrough, not a decision**: it means none of the 33 `_FAST_RAG_KEYWORDS` / 5 `_FAST_DIRECT_KEYWORDS` matched, so the bucket holds both genuinely off-topic questions *and* real tax questions phrased outside those keywords. Three outcomes must stay distinct:
+
+| Case | Route | Response |
+|---|---|---|
+| Tax question with data | `rag` | Real answer + citations |
+| Tax-shaped, retrieval empty | `curated` | Apology + **full contact table** (1161 + hours, e-Appointment, office finder) |
+| Keyword fallthrough | `out_of_scope` | **Conditional** wording ("if this is a tax question, call 1161") + one-line pointer |
+
+Collapsing these breaks in both directions: put the staff handoff on `out_of_scope` and someone asking about the weather is told to call the call centre; leave `out_of_scope` asserting "outside our scope" and a misclassified tax question is dead-ended. The `OUT_OF_SCOPE_USE_LLM=true` branch is deliberately *not* hedged — that path is a genuine determination. The flag defaults to `false`.
+
+**Abstain path:** if a `rag` turn retrieves nothing usable, `_no_source_response()` rewrites the turn to route `curated` with the canned `NO_SOURCE_ANSWER`, short-circuiting *both* generators with **no LLM call**. This is deliberate — with an empty context the generator would answer from model knowledge instead of the KB, which is exactly the hallucination being avoided. **Don't "fix" this by letting `generate_node` run on empty context.** `NO_SOURCE_ANSWER`'s line order is also load-bearing: `compact_spoken_answer()` speaks only the **first two lines**, so the apology + "โทร 1161" are spoken and the contact table stays screen-only. Don't reorder it.
+
+**Follow-up widening.** `build_retrieval_query(query, messages)` prepends the previous question to short anaphoric follow-ups ("แล้วถ้ามีลูก 3 คนล่ะ") — a bare follow-up measured **0 characters retrieved**, every time. It widens **only the retrieval query**; routing, answering and display are untouched. Fires only when the query is ≤ `_FOLLOWUP_MAX_CHARS` (40) **and** hits `_ANAPHORA_MARKERS`; skips form-code/alphanumeric queries so the lexical-first `[EXACT_MATCH]` path stays clean. Two rules from `HANDOFF.md` §3b Fix 4:
+- **Don't reuse `_FOLLOWUP_KEYWORDS` here** — it contains "ค่ะ"/"ครับ", which appear in ordinary self-contained questions.
+- **Order is `follow-up + previous`, and it matters.** The reverse measured 0 chars on a pair where this order gave 1894 (the combined vector fell under `RAG_SCORE_THRESHOLD`). Don't "tidy" it.
+
+`_is_tax_followup()` has **three** triggers and must keep all of them: `_FOLLOWUP_KEYWORDS` (affirmatives), `_ANAPHORA_MARKERS` (17 — the "แล้วถ้า… ล่ะ" shape), and `_PROCEDURAL_FOLLOWUP_TERMS` (8 — "which documents / which steps / by when / where"). A rescued follow-up routes to **`rag`**, not `direct`, or the widening never runs. These keyword triggers are the fast path; follow-ups phrased outside them fall through to the LLM classifier (step 3b). Both rescues **skip provider-recommendation questions** — before 2026-09-14 "แล้วธนาคารไหนดอกเบี้ยสูงสุดล่ะ" after a tax turn was rescued to `rag` purely on its "ล่ะ". This only shows up end-to-end; tests that call `parallel_node` with the route pre-set bypass the classifier entirely.
+
+> **`_PROCEDURAL_FOLLOWUP_TERMS` is concrete NOUNS, never bare interrogatives, and that is the whole design.** `ยังไง` and `อะไร` appear in `วันนี้อากาศเป็นยังไง` just as readily; keying on those rescues the weather question and collapses the three-way separation. A second safety layer is that `_is_tax_followup()` still requires the RECENT CONTEXT to contain a tax keyword, so these terms can only fire inside a conversation already about tax.
+
+**Retrieval candidate cascade.** `build_retrieval_candidates(query, messages)` returns an ordered list of **`(query, allow_low_score_rescue)` pairs** and `retrieve_node` takes the first that returns anything (`RETRIEVAL_CASCADE=false` restores one-query-one-attempt). No single anchor rule wins — each candidate rescues turns the others return 0 on:
+
+1. today's widened query (previous user question, if anaphoric and short)
+2. the bare query
+3. the query with English tax terms rendered in Thai
+4. `query + conversation opener` — **rescue flag OFF**
+5. `query + previous answer[:240]`, **only if the query is anaphoric** — **rescue flag OFF**
+
+The cascade only advances after a candidate has already come back empty, i.e. on turns already headed for the "call 1161" handoff, so it cannot over-widen a working turn.
+
+**The `allow_low_score_rescue` flag is load-bearing, and it gates BOTH ways around the score gate** — the low-score rescue *and* the exact-code shortcut. Candidates 4 and 5 are built from *borrowed* context, and neither bypass may argue from words the user didn't use. A query containing its own form code gets exactly one candidate (flag true), so a code reaching the retriever with the flag false is always borrowed: without that check, a conversation that *opened* on `ภ.ง.ด.90 คืออะไร` answered a later unrelated question with the ภ.ง.ด.90 chunk (fixture `formcode_opener_guard`). For the rescue specifically: Without the flag an off-topic question inherits tax vocabulary from the opener and then uses the inherited words to argue past the gate — measured: `ค่าจ้างขั้นต่ำปีนี้เท่าไหร่`, `จดทะเบียนสมรสใช้เอกสารอะไร` and `แล้วถ้าอยากซื้อคอนโดล่ะ` all leaked exactly that way. The anaphora gate on candidate 5 is separately load-bearing: it is the only candidate that rescues the salary-calculator chain, and also the only one that can inject a *different topic's* vocabulary.
+
+`AgentState` (`graph/state.py`) carries `sources: list` alongside `context` — citation records for the chunks behind the answer. **Only the `rag` branches actually set it**; the manual-emotion, curated, `direct` and `out_of_scope` branches omit the key entirely, so read it as `state.get("sources") or []` (which is what `agent.py:send_sources` does).
+
+### Retrieval (`graph/retriever.py`)
+
+`retrieve_with_sources(query, *, allow_low_score_rescue=True) -> (context_text, [citation dicts])` is the real entry point; `retrieve()` is a thin wrapper for callers that don't need citations. Hybrid search over Qdrant:
+- TCL topic → hard-coded `_TCL_CONTEXT` (no search).
+- Exact code/form terms → lexical search first; if hit, return it directly.
+- Dense vector search (embedding API, `lru_cache`d) + in-memory lexical search over all payloads (`_payload_cache`), fused with **reciprocal rank fusion** (lexical weighted higher), then `_prefer_domain()` reorders by `[PIT]`/`[VAT]`/`[REFUND]`.
+- Top dense score ≥ `RAG_EXACT_MATCH_SCORE` → prefix the context with `[EXACT_MATCH]`, which tells `generate_node` to preserve every number/condition verbatim.
+- Each returned chunk gets a citation record (`n`, `title`, `domain`, `subdomain`, `cluster_id`, `record_id`, `excerpt`, `url`, `outdated`) — this is what the panel's `[1][2][3]` markers resolve against. Every return path (TCL, exact-code, exact-match, score gate, fused) returns sources.
+
+**The score gate is not just `RAG_SCORE_THRESHOLD`.** That threshold (0.75) compares the top **dense** score only, and it is simultaneously too strict and too loose: genuine tax follow-ups measure 0.72–0.73 while off-topic questions reach 0.82. **Do not try to fix this by moving the threshold** — the two populations interleave and no value separates them. `scripts/threshold_sweep.py` proves it and prints the verdict; run it before reopening the question. Instead, `_should_rescue_low_score()` reconsiders a rejected query on two signals the gate never saw:
+
+- **Lexical ≥ `_LEXICAL_RESCUE_MIN` (12.0).** Not a fitted number — `_lexical_scored` awards exactly +12.0 when the whole normalized query appears verbatim in a chunk, so this is the line between "the corpus contains this phrasing" and "some words overlapped". Lexical is a high-precision **positive** signal only; it can rescue, never reject (many on-topic questions score ~1.0). **A lower cut leaks:** `จดทะเบียนสมรสใช้เอกสารอะไร` reaches 6.8 purely from the +6.0 `_DOCUMENT_TERMS` bonus on "เอกสาร".
+- **Explicit tax vocabulary above a `_TAX_VOCAB_RESCUE_FLOOR` of 0.72.** The floor exists because `ภาษีคาร์บอนเครดิตฟาร์มกุ้งคำนวณยังไง` is *also* explicitly about tax and **must keep abstaining** — it measures 0.6984, a 0.02 margin. **Don't tighten it**, and don't delete the `unanswerable_guard` fixture that holds it down.
+
+Note the lexical scan runs only for queries already headed for the handoff, so it costs nothing on the happy path.
+
+**English term aliases.** The corpus is Thai and bge-m3 does not map English abbreviations onto it — an English token actively drags the whole query vector down. Measured: `VAT คิดกี่เปอร์เซ็นต์` 0.6811 → 0 chars; **adding** Thai alongside (`ภาษีมูลค่าเพิ่ม VAT …`) 0.7193 → still 0; **replacing** it (`ภาษีมูลค่าเพิ่มคิดกี่เปอร์เซ็นต์`) 0.7721 → 2983 chars. So `_ENGLISH_TERM_ALIASES` / `_alias_expanded_query()` (in `graph/nodes.py`) **replace**, and feed both a cascade candidate and the `_fast_route` decision. Routing off the alias table rather than adding `cit`/`pit`/`wht` to `_FAST_RAG_KEYWORDS` is deliberate — that list is matched as a **bare substring**, so "cit" would fire inside "citizen" and "facility".
+
+**Payload trap:** `review_flags`, `ref_links` and `image_urls` are stored in Qdrant as **JSON-encoded strings**, not arrays — `if md.get("ref_links")` is true for the string `"[]"`. Parse with `_json_list()`, or every count comes back as the full point count.
+
+Corpus facts that shaped the citation design (measured over 1311 points): only **23 chunks (1.8%)** have real `rd.go.th` URLs, so a link-based citation UI would look broken 98% of the time — a URL is shown only when one exists. **969 (74%)** are flagged `needs_tax_review` and **143 (11%)** `possibly_outdated`. Only `possibly_outdated` surfaces a warning in the hover card today; `needs_tax_review` is carried in the data but not shown. `HANDOFF.md` §3b Fix 6 flags this as an open question the user hasn't ruled on — citation raises perceived authority over a corpus that is mostly self-flagged as unreviewed.
+
+### LiveKit data-channel protocol
+
+Agent → frontend JSON messages (`send_emotion` / `send_sources` / `send_chat_event`), all handled in `VoiceRoom`'s `RoomEvent.DataReceived`:
+
+| `type` | meaning |
+|---|---|
+| `emotion` (`{emotion}`) | drive the avatar — `happy` / `sad` / `angry` / `wow` / `sleep` / `idle` |
+| `chat_user` | echo the recognized/typed user text |
+| `chat_sources` (`{sources, diagnostics}`) | citation records + per-turn diagnostics (`route`, `retrieval_empty`, `job_id`, `agent_name`); sent once, before the answer. An empty list clears the previous turn's markers. |
+| `chat_status` | transient status ("กำลังคิดคำตอบ...") |
+| `voice_delta` / `voice_answer` | spoken answer, streaming then final. **`voice_answer` is always sent at the end of a turn — with empty text if nothing was spoken** (`_close_voice_turn()`), including on the error-fallback path. The frontend relies on it to end the voice half of the turn. |
+| `chat_delta` / `chat_answer` | detail-panel Markdown, streaming then final |
+
+Frontend → agent: `{type:"text_input", text}` (typed question) and `{type:"interrupt"}` (barge-in).
+
+**The UI is Thai-only.** An English translation feature (a `translate_detail` round-trip plus a TH/EN toggle) was removed in full — frontend state, the agent's `translate_detail_answer()`, and its dedicated translation LLM. Do not reintroduce `detailLanguage` ternaries; write Thai strings directly.
+
+### Emotion post-processing
+
+`normalize_emotion()` (`graph/nodes.py`) and `normalize_stream_emotion()` (`agent.py`) override the LLM's tag from keyword context: any "sad" trigger wins; `angry` is downgraded to `idle` unless a severe-case term is present; `idle` is promoted to `happy`/`wow` on positive terms. Valid set: `happy, sad, angry, wow, sleep, idle`. The keyword tables (`_ANGRY_CONTEXT_TERMS`, `_SAD_CONTEXT_TERMS`, `_HAPPY_CONTEXT_TERMS`, `_WOW_CONTEXT_TERMS`) are **duplicated in both files** — change both.
+
+> **They drifted once — `_ANGRY_CONTEXT_TERMS` was 13 in `agent.py` and 15 in `graph/nodes.py`.** Fixed 2026-09-10 by trimming nodes.py to match; all four tables are now identical and `scripts/test_conversation.py` **asserts that**, so a one-sided edit fails a test instead of silently diverging.
+>
+> `_ANGRY_CONTEXT_TERMS` is an **allow-list** — it lets an LLM-proposed `angry` stand and downgrades everything else to `idle`; it never forces angry. The two removed terms were substring false-positive generators: `ปรับ` fires inside `ปรับปรุง` ("ขอปรับปรุงข้อมูลผู้เสียภาษี" → angry) and `เงินเพิ่ม` inside `เงินเพิ่มเติม` ("ต้องจ่ายเงินเพิ่มเติมไหม" → angry), both benign. `เบี้ยปรับ` is the precise term and was already present. `AREE_SYSTEM_PROMPT` scopes angry to หนีภาษี / ทุจริต / เอกสารปลอม / คดีอาญา and explicitly excludes ordinary tax explanations.
+>
+> Beware: all four tuples end with the same lines, so a naive `str.replace` edit hits more than one of them.
+
+### Problem reporting
+
+A user-facing "report a problem" flow, deliberately backed by files rather than a database (a DB service would mean another image in the prebuilt-release handoff):
+
+- `app/api/report/route.ts` — POST, session-gated. Identity comes from the session cookie, **never** the body. Appends one sanitized JSON line to `${REPORT_DIR}/reports-YYYY-MM.jsonl`. Captures the reported turn, its `sources`, the `chat_sources` diagnostics, and client state (mic error *name*, connection status, viewport). `schema_version` is there to make a later lift into Postgres mechanical.
+- `app/api/admin/reports/route.ts` — GET (`?format=summary|json|csv|files`, `since`/`until`) and POST `?action=rotate`. There is **no admin role in the auth model**, so this route carries its own gate: a shared secret in `REPORT_ADMIN_TOKEN`, compared with `timingSafeEqual`. Unset ⇒ 404 (so it doesn't advertise itself). It is exact-match allowlisted in `proxy.ts` so a cookie-less `curl` can reach it.
+- `scripts/reports.mjs` — the same read/rotate operations as a CLI, meant to be run against the `report_data` named volume on the server. Also `purge`, which enforces the **6-month retention policy** (decided 2026-09-10; `REPORT_RETENTION_MONTHS` overrides). Dry-run by default, `--yes` to delete, and **manual on purpose** — nothing should silently destroy the only copy of user-reported data on an unwatched timer. The `docker run` example in that file mounts the volume `:ro`, which purge cannot use.
+
+### Frontend component tree
+
+```
+app/page.tsx
+└── VoiceRoom (components/VoiceRoom.tsx)   — ~3.5k lines: LiveKit room, audio analyser,
+    │                                        data-channel handler, Markdown renderer,
+    │                                        citation popovers, session-history rail,
+    │                                        report modal, push-to-talk
+    └── LumoFace (components/LumoFace.tsx) — currently a STATIC <img> of public/avatar/aree_cutout.png
+```
+
+**`LumoFace` no longer animates.** It still exports `LumoFaceHandle` with `setMode` / `setAmplitude` / `setGazeState`, but all three are **no-ops**. `VoiceRoom` still drives them (amplitude via a `requestAnimationFrame` loop, mode from `emotion` packets, gaze from turn state), so the whole emotion pipeline is live end-to-end and simply has no visual effect. The SVG eye/face assets it used to drive are still in `public/avatar/` and `avatar_extraction/`. Treat the call sites as the intact seam for restoring animation — don't delete them as dead code.
+
+### API routes
+
+- `app/api/livekit/token/route.ts` — far more than a token mint. It derives the room name **server-side** from the session (`nongaree-${safeUser}`, sanitized) so a client can't request another user's room, optionally resets the room (`LIVEKIT_RESET_ROOM_ON_TOKEN=true` + `?reset=true`), then **explicitly dispatches** the agent: serialized per-room by a `dispatchLocks` promise map, clearing stale dispatches and removing duplicate agent participants, because dev refresh / StrictMode double-fetches used to stack multiple bots in one room. Also fire-and-forget-logs an SSO `Load` transaction.
+- `app/api/report/route.ts`, `app/api/admin/reports/route.ts` — see above.
+- `app/api/session/memory/route.ts` — session-gated `DELETE`, clears the caller's stored conversation memory. Called from `handleLogout` **before** the SSO logout, while the cookie is still valid. A separate route on purpose: the alternative was editing `app/api/auth/sso/logout/route.ts`, which `HANDOFF.md` §1 lists as off-limits. Identity comes from the cookie and there is no user parameter, so one user cannot clear another's.
+- `app/api/login/route.ts`, `app/api/logout/route.ts`, `app/api/auth/sso/*` — see Authentication.
+
+### Authentication
+
+Every route except a small public allowlist is gated. **The gate is `proxy.ts` at the repo root** — in Next.js 16 the file formerly known as `middleware.ts` is `proxy.ts` (exports a `proxy` function + a `config.matcher`). It verifies the session cookie and redirects unauthenticated browser requests to `/login` (API requests get a 401). Public paths: `/login`, `/api/auth/sso/callback`, `/api/auth/sso/logout`, **`/api/admin/reports`** (exact match, not a `/api/admin/*` wildcard — the route enforces its own token), `/_next/*`, `/favicon.ico`.
+
+Two independent auth mechanisms exist, and the RD SSO one is the live path:
+
+- **RD SSO (production)** — `lib/sso/` + `app/api/auth/sso/`. The RD portal POSTs to `/api/auth/sso/callback` with `Username`, a timestamp (`Timestamp`/`ReqTime`), `Signature`, and optionally `TokenID`. Flow: `verifySsoSignature()` (SHA-1 of `SSO_KEY + timestamp`, accepts both hex→base64 and raw-base64 encodings) → `getSsoUser()` SOAP call (`Get_SSO_User`) → mint a session cookie → fire-and-forget `SSO_APP_Transaction_Log` → 303 redirect to `APP_URL`. Logout (`/api/auth/sso/logout`) calls `SSO_App_LogOut` and clears the cookie. The SOAP client in `lib/sso/soap.ts` hand-builds envelopes and regex-extracts tags (no XML lib); `extractTag` tolerates namespace prefixes.
+- **Local password login (legacy/UAT)** — `app/api/login/route.ts` checks a hardcoded `USERS` map and sets a plain `site_auth` cookie. The `/login` page (`app/login/page.tsx`) no longer renders a form — it shows an SSO-only notice — so this route is effectively retired but not deleted. Both logout routes also clear `site_auth`.
+
+**Session token format** (`lib/auth/session.ts`): a custom `base64url(payload).base64url(HMAC-SHA256)` string signed with `SSO_SESSION_SECRET` (falls back to `SSO_KEY`), stored in the `nongaree_sso_session` HttpOnly cookie (7-day TTL). Built on Web Crypto (`crypto.subtle`) so it runs in any runtime; routes that use it pin `export const runtime = "nodejs"`. There is no server-side session store — the cookie is self-contained and stateless.
+
+SSO config lives in `docker container/.env.sso` (see `docs/SSO_UAT.md`), separate from the general `.env`.
+
+## Docker
+
+Four compose files, four different jobs:
+
+| File | Purpose |
+|---|---|
+| `docker-compose.yml` | **The deployment file.** `qdrant` + `qdrant-restore` (one-shot snapshot loader the others wait on) + `web` (loads `docker container/.env` **and** `.env.sso`, `extra_hosts` mapping RD internal SSO/security-portal hostnames to fixed IPs) + `agent`. Named volumes: `report_data` at `/data/reports` on `web`, and `memory_data` at `/data/memory` on **both** `web` and `agent`. |
+| `docker-compose.local.yml` | **Local demo, not for deployment.** Drops `.env.sso` and the RD `extra_hosts`, pins a throwaway `SSO_SESSION_SECRET` and `REPORT_ADMIN_TOKEN`, and sets `AGENT_NAME` to `nongaree-agent-local` on *both* `web` and `agent`. Host Qdrant port is `6333`, not `8102` — `8102` is inside a Windows reserved range. |
+| `docker-compose.dev.yml` | `web` only, `node:22-bookworm-slim` running `npm install && npm run dev` over a bind mount. |
+| `docker-compose.selfhost.yml` | **Test override, additive — delete it to revert.** Layers on top of `docker-compose.local.yml` to point the local stack at the self-hosted LiveKit on the RD server instead of Cloud: `agent` → `ws://10.223.5.31:7880` (plain, bypassing Caddy), `web` → `wss://livekit.rd.go.th` with `NODE_EXTRA_CA_CERTS`. Needs the RD VPN. **Production stays on Cloud.** |
+
+Build contexts point at `docker container/Dockerfile` and `docker container/Dockerfile.agent`. After changing anything the browser or SSO relies on, rebuild the `web` image.
+
+> **Trap — `Dockerfile.agent` copies files individually** (`COPY agent.py`, `COPY latency.py`, `COPY graph ./graph`). There is **no `COPY *.py`**. A new top-level Python module passes `py_compile`, works in every offline harness, and then `ModuleNotFoundError`s in the deployed image — fixable only by editing a protected file. **Put new Python modules under `graph/`.** This is also why the memory logic lives in `graph/conversation.py` rather than beside `agent.py`.
+
+**Verifying without `node_modules`** — build the Dockerfile's `builder` stage, which runs `npm ci && npm run build`. **Never `docker compose build web`**: that overwrites the `nongaree-voicebot-web:latest` tag the deployment uses. Use a throwaway tag, and note that Next.js 16 does **not** run ESLint during `next build`, so lint separately against the `deps` stage (which still has devDeps). Exact commands are in `HANDOFF.md` §5.
+
+**Running locally without RD SSO** (the reason `docker-compose.local.yml` exists):
+```bash
+node scripts/mint-local-session.mjs        # writes local-login/index.html (git-ignored)
+docker compose -p nongaree-local -f docker-compose.local.yml up --build -d
+# open the local-login page, click to set the cookie, then open the web port
+```
+`mint-local-session.mjs` re-implements `lib/auth/session.ts`'s signing rather than importing it — it touches nothing under `lib/sso/` or `app/api/auth/`. The auth gate stays fully enforced; you just sign in with a locally minted cookie. Cookies are scoped by domain, not port, which is why the login page on one port works for the app on another.
+
+**Ports are not fixed — check before assuming 3000/3001.** Windows reserved ranges move. As of 2026-09-01 the defaults `3000`/`3001` had landed inside a reserved range (2970-3069) and the stack was brought up with `LOCAL_WEB_PORT=4300 LOCAL_LOGIN_PORT=4301`. Both the compose file and the mint script read those vars, so no file edit is needed — but **re-run the mint script whenever you change them**, or the login button points at the wrong port. Check the current reserved ranges with `netsh interface ipv4 show excludedportrange protocol=tcp`.
+
+**Why `AGENT_NAME` matters locally:** the local agent and the deployed agent register against the *same* LiveKit cloud project. If both use the default `nongaree-agent`, LiveKit load-balances dispatches across every registered worker — so a local test can be answered by the server (and a real user's question by your dev machine). Rooms are per-user, so nothing leaks between rooms; the issue is *which build of the code* served the turn. A local test proves nothing unless you confirm your container took the job: `rtk proxy docker logs nongaree-local-agent-1 | grep job_id`. (Plain `docker logs` is summarized by the `rtk` hook, which silently breaks `grep`.)
+
+The company-handoff path uses prebuilt images from a GitHub Release instead of building from source — see `COMPANY_DOCKER_HANDOFF.md`, `docker container/README.md`, and `docker container/INSTALL_EN.md`.
+
+## Other key design decisions
+
+- **LLMs are lazy-initialized singletons** in `graph/nodes.py` (`_get_router_llm`, `_get_generate_llm`, `_get_text_generate_llm`, `_get_out_of_scope_llm`).
+- **`latency.py` exposes a module-level `tracker`** (`LatencyTracker`) imported by both `graph/nodes.py` and `agent.py`; nodes write timestamps into it and `tts_node` calls `tracker.log_summary()` on first audio.
+- **`graph/graph.py` must be imported after `load_dotenv()`** — the `# noqa: E402` in `agent.py` is intentional.
+- **`WavTTS`** is a custom `livekit-agents` TTS: strips the 44-byte WAV header, emits raw PCM @ 24kHz mono.
+- **`requirements.txt` pins `livekit-agents==1.6.0`** — 1.6.5 pulls `livekit-local-inference`, whose wheel needs AVX (target host `rd1` has none).
+- **Push-to-talk**: mic disabled by default; Space or button-hold enables it.
+- **Agent session lifecycle.** The LiveKit *room* outlives the `AgentSession` — handlers registered in `entrypoint()` stay live after a participant leaves, and calling `session.say()` then raises `RuntimeError: AgentSession isn't running`. All three `say()` call sites go through `_say_if_running()`, which returns `False` instead of raising; `ctx.shutdown()` runs from the public `@session.on("close")` handler so a rejoin gets a **fresh** job. `on_data_received` is deliberately **not** gated on `session_closed` — the detail panel publishes over `ctx.room`, so a dead session can still deliver a written answer. Data-channel publishing never goes through the session.
+- **The panel answer must survive a spoken-path failure.** `_detail_answer_if_delivered()` + `DETAIL_GRACE_TIMEOUT_S` mean the error fallback only overwrites the detail panel when the detail task produced nothing; a slow-but-running task is awaited under `asyncio.shield` so the guard can't cancel it. A regression here looks like a correct answer replaced by "ขอโทษ ระบบใช้เวลานาน..." — that string lives **only** in `agent.py`; the frontend's own timeout copy is different ("ยังไม่ได้รับคำตอบจากบอท...").
+- **Frontend answer retention.** `beginPendingAnswer()` / `commitPendingAnswer()` keep the previous question *and* answer on screen until the first token of the new one lands. Three things had to change together and must not be undone individually: `chat_status` is suppressed while an answer is retained (it was a second wipe), `awaitingAnswer` is part of the settle-timer check *and* its dep array, and the 35s timeout commits the swap rather than leaving stale content attributed to a new question. The agent sends `chat_user` on *any* committed STT transcript, so a partial recognition used to erase an answer the user was still reading.
+- **`graph/text_normalization.py`**: `clean_display_text()` (screen) and `normalize_for_tts()` (numbers→Thai words, English→Thai) — applied to every answer.
+- **Frontend turn state — three ways a single turn used to freeze the whole UI.** `willQueue = turnActive || …`, and `turnActive` only clears through the settle timer, which only starts when **every** `rawBusy` term is false (`isAgentSpeaking`, `awaitingAnswer`, the `กำลังเตรียมคำตอบสั้น...` speech placeholder, the panel placeholders). If any term can get stuck, every later question is queued client-side forever and the agent never hears it. All three were found by a browser regression pass (`HANDOFF.md` §3e Fixes 21–23) and each has a deterministic repro:
+  - **The speech placeholder lives only in STATE.** `sendTextMessage` / `chat_user` deliberately leave `speechPreviewRef` as `''` so `voice_delta` can append into it. Anything that needs to clear the placeholder must test the state (use an updater), never the ref.
+  - **The analyser watches ONE track, but several agent tracks can be subscribed** while the token route removes duplicates. `TrackUnsubscribed` must only stop the analyser for its own track, and `stopAnalyser()` must reset `isAgentSpeaking` — a stopped analyser can't update it, so it would freeze at its last value.
+  - **The 35s response timeout is the only backstop, so it stays armed until BOTH halves report** (`noteAnswerProgress('panel' | 'voice')`). It used to be cancelled by the first panel token, so a turn whose spoken side produced nothing left the placeholder up with nothing able to clear it. The agent side of the same fix is the always-sent `voice_answer`.
+- **Agent-presence watchdog (`VoiceRoom.tsx`, `HANDOFF.md` §3e Fix 25).** The token route dispatches only when it sees no agent participant, but an agent whose user just closed the tab lingers up to ~25s — a quick reopen reuses it, it leaves, and nothing dispatches again. So when the room has had **no agent for 20s** (after the last one leaves, or right after joining), the page **re-requests `/api/livekit/token` without leaving the room** (token ignored; the route's dispatch logic does the work), retrying every 30s, capped at 3, reset when an agent joins. **Never "simplify" this into a reconnect** (`connectAttempt`): leaving the room ends the next agent's job too and recreates the race. It must only fire when *no* agent remains — duplicate removal with a survivor is routine.
+- **The harness and production enter the graph at different points.** `scripts/multiturn_benchmark.py` drives `compiled_graph.ainvoke()`; production goes through `prepare_response_state()` in `agent.py`, which builds `messages` from its own memory dict. Same graph, different entry point — and real bugs have lived in that seam (`HANDOFF.md` §3b Fix 9, §3e Fix 18). A green harness run is not proof for anything that touches routing inputs or the turn lifecycle; re-check inside the agent container.
+- **A browser verdict means little without a corroborating line in the AGENT log.** Repeatedly in this project a test result turned out to be an artefact of the probe: the greeting is audio-only and never appears in the DOM, `chat_sources` is published *before* the answer so citation markers mean a turn STARTED, and the send button returns to `ส่ง` when the panel answer completes — seconds before the voice does.
+- Files named `*.before-<reason>-<date>` at the repo root are manual pre-change snapshots standing in for the missing git history. Leave them alone.
+
+## Docs
+
+- `docs/PROJECT_STRUCTURE.md` — layout and runtime flows
+- `docs/DETAILED_PREVIEW_HANDOFF.md` — detail-panel implementation notes
+- `docs/QA_QUERY_EXPECTATIONS.md` — copy/paste supervisor QA queries + expected answer shapes (use when reviewing output quality)
+- `docs/SSO_UAT.md` — SSO UAT setup
+- `docs/AREE_BOT_FULL_HANDOFF_SUMMARY.md` (+ `_TH`) — long-form project summary

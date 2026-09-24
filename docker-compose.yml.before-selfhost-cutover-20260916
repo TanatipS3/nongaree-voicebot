@@ -1,0 +1,86 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      - "${QDRANT_PORT:-8102}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  qdrant-restore:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+      SNAPSHOT_PATH: /snapshots/thai_tax_kb.snapshot.tar.gz
+    volumes:
+      - ./docker container/qdrant/snapshots:/snapshots:ro
+      - ./docker container/qdrant/scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/restore-qdrant-snapshot.sh"]
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile
+    image: nongaree-voicebot-web:latest
+    env_file:
+      - ./docker container/.env
+      - ./docker container/.env.sso
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "securityportal.rd.go.th:10.29.1.50"
+      - "ws_sso.rd.go.th:10.29.1.51"
+      - "sso.tst.rd.local:10.20.29.13"
+      - "tstws_sso.rd.go.th:10.20.29.17"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    volumes:
+      # Problem reports (append-only JSONL, rotated monthly). A named volume so
+      # reports survive image rebuilds and a retention policy can be enforced by
+      # deleting a file rather than migrating rows.
+      - report_data:/data/reports
+      # Conversation memory (one JSON per user, 30-minute idle TTL, pruned lazily).
+      # Same file-backed approach as report_data and for the same reason: a database
+      # would add a service and an image to the prebuilt-release handoff.
+      # If this mount is absent the agent logs a warning once and falls back to
+      # in-process memory, i.e. previous behaviour — it does not crash.
+      - memory_data:/data/memory
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile.agent
+    image: nongaree-voicebot-agent:latest
+    env_file:
+      - ./docker container/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    volumes:
+      # Conversation memory (one JSON per user, 30-minute idle TTL, pruned lazily).
+      # Same file-backed approach as report_data and for the same reason: a database
+      # would add a service and an image to the prebuilt-release handoff.
+      # If this mount is absent the agent logs a warning once and falls back to
+      # in-process memory, i.e. previous behaviour — it does not crash.
+      - memory_data:/data/memory
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  report_data:
+  memory_data:

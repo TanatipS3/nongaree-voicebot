@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LumoFace Avatar</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:monospace;gap:16px}
+canvas{display:block}
+.lbl{font-size:13px;color:rgba(255,255,255,0.5);letter-spacing:0.2em;min-height:16px}
+.glbl{font-size:10px;color:rgba(255,255,255,0.25);letter-spacing:0.1em;min-height:14px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+button{font-size:10px;padding:5px 14px;background:transparent;border:1px solid rgba(255,255,255,0.18);color:rgba(255,255,255,0.45);border-radius:3px;cursor:pointer;font-family:monospace;letter-spacing:0.08em;transition:all 0.15s}
+button:hover{border-color:rgba(255,255,255,0.6);color:#fff}
+button.on{border-color:#fff;color:#fff}
+</style>
+</head>
+<body>
+
+<canvas id="c" width="500" height="260"></canvas>
+<div class="lbl" id="lbl">IDLE</div>
+<div class="glbl" id="glbl">gaze: CENTER</div>
+<div class="btns">
+  <button id="bI" class="on">IDLE</button>
+  <button id="bT">TALK</button>
+  <button id="bH">HAPPY</button>
+  <button id="bSd">SAD</button>
+  <button id="bAn">ANGRY</button>
+  <button id="bW">WOW</button>
+  <button id="bSl">SLEEP</button>
+</div>
+
+<script>
+/* ============================================================
+   LumoFace — canvas avatar
+   Public API:
+     setMode(mode)  — 'idle'|'talk'|'happy'|'sad'|'angry'|'wow'|'sleep'
+   For LiveKit:
+     - call setMode('talk') when agent starts speaking
+     - call setMode('idle') when agent stops speaking
+     - parse [EMOTION:x] tags from LLM response → setMode(x)
+   ============================================================ */
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+let mode = 'idle', t = 0, lastTs = null;
+
+// ---- EYE SHAPE PER MODE ----
+const MODES = {
+  idle:  { w:96,  h:74,  rx:10, tiltT:0,  tiltB:0, browA:0,    browY:-6,  browH:3, glow:0.55, happy:0, wowPulse:0 },
+  talk:  { w:88,  h:80,  rx:10, tiltT:0,  tiltB:0, browA:0,    browY:-6,  browH:3, glow:0.75, happy:0, wowPulse:0 },
+  happy: { w:96,  h:70,  rx:10, tiltT:0,  tiltB:0, browA:0.1,  browY:-10, browH:3, glow:0.75, happy:1, wowPulse:0 },
+  sad:   { w:84,  h:60,  rx:6,  tiltT:1,  tiltB:0, browA:-0.2, browY:-4,  browH:3, glow:0.4,  happy:0, wowPulse:0 },
+  angry: { w:90,  h:58,  rx:4,  tiltT:-1, tiltB:0, browA:0.3,  browY:-3,  browH:4, glow:0.6,  happy:0, wowPulse:0 },
+  wow:   { w:110, h:110, rx:14, tiltT:0,  tiltB:0, browA:0,    browY:-18, browH:3, glow:1.0,  happy:0, wowPulse:1 },
+  sleep: { w:96,  h:14,  rx:6,  tiltT:0,  tiltB:0, browA:0,    browY:-4,  browH:3, glow:0.25, happy:0, wowPulse:0 },
+};
+
+// ---- GAZE STATE MACHINE ----
+const GAZE_STATES = {
+  center: { label:'CENTER',  x:0,     y:0,    dur:()=>2.5+Math.random()*2   },
+  left:   { label:'LEFT',    x:-0.7,  y:0,    dur:()=>0.6+Math.random()*0.8 },
+  right:  { label:'RIGHT',   x:0.7,   y:0,    dur:()=>0.6+Math.random()*0.8 },
+  up:     { label:'UP',      x:0,     y:-0.6, dur:()=>0.5+Math.random()*0.6 },
+  downL:  { label:'DOWN-L',  x:-0.4,  y:0.5,  dur:()=>0.4+Math.random()*0.5 },
+  downR:  { label:'DOWN-R',  x:0.4,   y:0.5,  dur:()=>0.4+Math.random()*0.5 },
+  thinkL: { label:'THINK-L', x:-0.85, y:-0.3, dur:()=>1.2+Math.random()*1.0 },
+  thinkR: { label:'THINK-R', x:0.85,  y:-0.3, dur:()=>1.2+Math.random()*1.0 },
+};
+
+const GAZE_WEIGHTS = {
+  idle:  { center:50, left:10, right:10, up:5,  downL:5,  downR:5,  thinkL:5,  thinkR:5  },
+  talk:  { center:70, left:5,  right:5,  up:3,  downL:2,  downR:2,  thinkL:5,  thinkR:5  },
+  happy: { center:40, left:15, right:15, up:15, downL:5,  downR:5,  thinkL:2,  thinkR:2  },
+  sad:   { center:20, left:10, right:10, up:5,  downL:25, downR:25, thinkL:2,  thinkR:2  },
+  angry: { center:30, left:20, right:20, up:15, downL:5,  downR:5,  thinkL:2,  thinkR:2  },
+  wow:   { center:60, left:10, right:10, up:15, downL:2,  downR:2,  thinkL:0,  thinkR:0  },
+  sleep: { center:100,left:0,  right:0,  up:0,  downL:0,  downR:0,  thinkL:0,  thinkR:0  },
+};
+
+function pickNextGaze(currentMode, currentState) {
+  const weights = GAZE_WEIGHTS[currentMode] || GAZE_WEIGHTS.idle;
+  const filtered = Object.entries(weights).filter(([k]) => k !== currentState);
+  const total = filtered.reduce((s,[,v]) => s+v, 0);
+  let r = Math.random() * total;
+  for (const [k,v] of filtered) { r -= v; if (r <= 0) return k; }
+  return 'center';
+}
+
+const gaze = {
+  state: 'center',
+  x:0, y:0, tx:0, ty:0,
+  timer:3, speed:3,
+};
+
+const EYE_SHIFT = 14;
+
+// ---- INTERPOLATED STATE ----
+const s = {
+  w:96, h:74, rx:10, tiltT:0, tiltB:0, browA:0, browY:-6, browH:3,
+  glow:0.55, happy:0, wowPulse:0,
+  blink:1, blinking:false, blinkP:0, nextBlink:3+Math.random()*4,
+  talkPhase:0, floatY:0,
+};
+
+const L  = (a,b,t) => a+(b-a)*t;
+const ei = x => x<.5 ? 2*x*x : 1-Math.pow(-2*x+2,2)/2;
+
+// ---- PUBLIC API ----
+function setMode(m) {
+  if (!MODES[m]) return;
+  mode = m;
+  document.getElementById('lbl').textContent = m.toUpperCase();
+  document.querySelectorAll('button').forEach(b => b.classList.remove('on'));
+  const idMap = { idle:'bI',talk:'bT',happy:'bH',sad:'bSd',angry:'bAn',wow:'bW',sleep:'bSl' };
+  const el = document.getElementById(idMap[m]);
+  if (el) el.classList.add('on');
+  // force gaze intent on mode change
+  if (m === 'talk' || m === 'wow') {
+    gaze.state='center'; gaze.tx=0; gaze.ty=0; gaze.timer=1.5;
+  }
+  if (m === 'sad') {
+    gaze.state='downL'; gaze.tx=GAZE_STATES.downL.x; gaze.ty=GAZE_STATES.downL.y; gaze.timer=1.2;
+  }
+}
+
+// ---- GAZE UPDATE ----
+function updateGaze(dt) {
+  if (mode === 'sleep') return;
+  gaze.timer -= dt;
+  if (gaze.timer <= 0) {
+    const next = pickNextGaze(mode, gaze.state);
+    gaze.state = next;
+    const gs = GAZE_STATES[next];
+    gaze.tx = gs.x; gaze.ty = gs.y;
+    gaze.timer = gs.dur();
+    gaze.speed = 8 + Math.random()*4; // saccade fast
+    document.getElementById('glbl').textContent = 'gaze: ' + gs.label;
+  }
+  const dist = Math.abs(gaze.x-gaze.tx) + Math.abs(gaze.y-gaze.ty);
+  if (dist < 0.05) gaze.speed = Math.max(1, gaze.speed - dt*6); // settle after saccade
+  gaze.x = L(gaze.x, gaze.tx, dt*gaze.speed);
+  gaze.y = L(gaze.y, gaze.ty, dt*gaze.speed);
+}
+
+// ---- DRAW HAPPY EYE (crescent ^) ----
+function drawHappyEye(cx, cy, w, h, glow, blink, isTalk, talkPhase) {
+  ctx.save(); ctx.translate(cx, cy);
+  const bh = h * Math.max(blink, 0.04);
+  const ga = glow * (isTalk ? 0.9+0.3*Math.abs(Math.sin(talkPhase*9)) : 1);
+  ctx.beginPath();
+  ctx.ellipse(0, 0, w/2, bh, 0, Math.PI, 0);
+  ctx.closePath();
+  ctx.shadowColor = `rgba(255,255,255,${ga*0.7})`; ctx.shadowBlur = 32;
+  ctx.fillStyle = 'rgba(255,255,255,0.95)'; ctx.fill(); ctx.shadowBlur = 0;
+  ctx.shadowColor = `rgba(255,255,255,${ga*0.35})`; ctx.shadowBlur = 60;
+  ctx.fill(); ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+// ---- DRAW NORMAL EYE (rounded trapezoid) ----
+function drawNormalEye(cx, cy, w, h, rx, tiltT, tiltB, glow, blink, isTalk, talkPhase, side, wowPulse) {
+  if (h*blink < 1) return;
+  ctx.save(); ctx.translate(cx, cy);
+  const bh = h * blink;
+  const tT = (side==='R') ? -tiltT : tiltT;
+  const tB = (side==='R') ? -tiltB : tiltB;
+  const tm = 20;
+  const tlY=-bh/2+tT*tm, trY=-bh/2-tT*tm, brY=bh/2+tB*tm, blY=bh/2-tB*tm;
+  const x0=-w/2, x1=w/2;
+  ctx.beginPath();
+  ctx.moveTo(x0+rx, tlY);
+  ctx.lineTo(x1-rx, trY); ctx.arcTo(x1,trY, x1,trY+rx, rx);
+  ctx.lineTo(x1, brY-rx); ctx.arcTo(x1,brY, x1-rx,brY, rx);
+  ctx.lineTo(x0+rx, blY); ctx.arcTo(x0,blY, x0,blY-rx, rx);
+  ctx.lineTo(x0, tlY+rx); ctx.arcTo(x0,tlY, x0+rx,tlY, rx);
+  ctx.closePath();
+  const pulse = wowPulse>0.01 ? wowPulse*(0.3+0.3*Math.abs(Math.sin(t*4))) : 0;
+  const ga = Math.min(1, glow+pulse) * (isTalk ? 0.9+0.3*Math.abs(Math.sin(talkPhase*9)) : 1);
+  if (wowPulse > 0.01) {
+    ctx.shadowColor=`rgba(255,255,255,${ga*0.25})`; ctx.shadowBlur=80;
+    ctx.fillStyle='rgba(255,255,255,0.05)'; ctx.fill(); ctx.shadowBlur=0;
+  }
+  ctx.shadowColor=`rgba(255,255,255,${ga*0.7})`; ctx.shadowBlur=32;
+  ctx.fillStyle=`rgba(255,255,255,${0.88+ga*0.12})`; ctx.fill(); ctx.shadowBlur=0;
+  ctx.shadowColor=`rgba(255,255,255,${ga*0.4})`; ctx.shadowBlur=60;
+  ctx.fill(); ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ---- DRAW BROW ----
+function drawBrow(cx, cy, w, angle, side, thickness) {
+  ctx.save(); ctx.translate(cx, cy);
+  ctx.rotate((side==='R') ? -angle : angle);
+  ctx.beginPath(); ctx.moveTo(-w*0.44, 0); ctx.lineTo(w*0.44, 0);
+  ctx.strokeStyle='rgba(255,255,255,0.8)'; ctx.lineWidth=thickness; ctx.lineCap='round';
+  ctx.shadowColor='rgba(255,255,255,0.4)'; ctx.shadowBlur=12;
+  ctx.stroke(); ctx.shadowBlur=0;
+  ctx.restore();
+}
+
+// ---- MAIN LOOP ----
+function frame(ts) {
+  if (!lastTs) lastTs = ts;
+  const dt = Math.min((ts-lastTs)/1000, 0.05); lastTs=ts; t+=dt;
+
+  const tgt = MODES[mode];
+  const sp = dt*7;
+  s.w      = L(s.w,      tgt.w,      sp);
+  s.h      = L(s.h,      tgt.h,      sp);
+  s.rx     = L(s.rx,     tgt.rx,     sp);
+  s.tiltT  = L(s.tiltT,  tgt.tiltT,  sp);
+  s.tiltB  = L(s.tiltB,  tgt.tiltB,  sp);
+  s.browA  = L(s.browA,  tgt.browA,  sp);
+  s.browY  = L(s.browY,  tgt.browY,  sp);
+  s.browH  = L(s.browH,  tgt.browH,  sp);
+  s.glow   = L(s.glow,   tgt.glow,   dt*3);
+  s.happy  = L(s.happy,  tgt.happy,  sp);
+  s.wowPulse = L(s.wowPulse, tgt.wowPulse, sp);
+
+  // blink
+  if (mode !== 'sleep') {
+    if (!s.blinking) {
+      s.nextBlink -= dt;
+      if (s.nextBlink <= 0) { s.blinking=true; s.blinkP=0; s.nextBlink=2.8+Math.random()*5; }
+    } else {
+      s.blinkP += dt*7;
+      if (s.blinkP >= 1) { s.blinking=false; s.blinkP=0; }
+    }
+    s.blink = s.blinking ? Math.max(0.04, s.blinkP<.5 ? 1-ei(s.blinkP*2) : ei((s.blinkP-.5)*2)) : 1;
+  } else { s.blink = 1; }
+
+  if (mode === 'talk') s.talkPhase += dt;
+  s.floatY = Math.sin(t*0.65) * 5;
+
+  updateGaze(dt);
+
+  ctx.fillStyle = '#000'; ctx.fillRect(0,0,W,H);
+
+  const cy = H/2 + s.floatY;
+  const EX = W/2, gap = 115;
+  const isTalk = mode === 'talk';
+  const gx = gaze.x * EYE_SHIFT;
+  const gy = gaze.y * (EYE_SHIFT*0.5);
+
+  if (s.happy > 0.01) {
+    drawHappyEye(EX-gap+gx, cy+gy, s.w, s.h*0.55, s.glow, s.blink, isTalk, s.talkPhase);
+    drawHappyEye(EX+gap+gx, cy+gy, s.w, s.h*0.55, s.glow, s.blink, isTalk, s.talkPhase);
+  }
+  if (s.happy < 0.99) {
+    ctx.globalAlpha = 1 - s.happy;
+    drawNormalEye(EX-gap+gx, cy+gy, s.w,s.h,s.rx,s.tiltT,s.tiltB,s.glow,s.blink,isTalk,s.talkPhase,'L',s.wowPulse);
+    drawNormalEye(EX+gap+gx, cy+gy, s.w,s.h,s.rx,s.tiltT,s.tiltB,s.glow,s.blink,isTalk,s.talkPhase,'R',s.wowPulse);
+    ctx.globalAlpha = 1;
+  }
+
+  const browCy = cy+gy - s.h/2*s.blink + s.browY - 12;
+  if (mode !== 'sleep') {
+    drawBrow(EX-gap+gx, browCy, s.w, s.browA, 'L', s.browH);
+    drawBrow(EX+gap+gx, browCy, s.w, s.browA, 'R', s.browH);
+  }
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- BUTTON BINDINGS ----
+const btnMap = { bI:'idle',bT:'talk',bH:'happy',bSd:'sad',bAn:'angry',bW:'wow',bSl:'sleep' };
+Object.entries(btnMap).forEach(([id,m]) => document.getElementById(id).onclick = () => setMode(m));
+</script>
+</body>
+</html>

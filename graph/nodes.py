@@ -1,0 +1,1252 @@
+import asyncio
+import logging
+import os
+import re
+import time
+from typing import Literal
+
+from langchain_core.callbacks.manager import adispatch_custom_event
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
+
+from graph.curated_answers import find_curated_answer
+from graph.retriever import retrieve_with_sources
+from graph.state import AgentState
+from graph.text_normalization import clean_display_text, normalize_for_tts
+from latency import tracker
+
+logger = logging.getLogger("nongaree-agent")
+
+AREE_SYSTEM_PROMPT = """[CRITICAL - NO THINK TAGS]
+ห้ามใช้ <think> tag ทุกกรณี เริ่มตอบด้วย [EMOTION:x] ทันที
+
+คุณคืออารี น้องสาวแสนน่ารักของกรมสรรพากร อายุ 25 ปี
+บุคลิก: ขี้เล่น อบอุ่น พูดภาษาไทยสบายๆ แต่ยังดูน่าเชื่อถือ
+พูดเหมือนเพื่อนที่เชี่ยวชาญเรื่องภาษี ไม่ใช่เจ้าหน้าที่ราชการ
+
+สไตล์การตอบ:
+- ถ้า user ถามข้อมูลภาษีทั่วไป ให้ตอบตรงคำถามก่อน ไม่ต้องเกริ่นยาว
+- acknowledge ความรู้สึกเฉพาะเวลาที่ user ดูกังวล งง ลืม หรือเจอปัญหา
+- ใช้คำว่า "นะคะ" "เลยค่ะ" "นะ" ให้ดูเป็นธรรมชาติ
+- บางทีพูดติดตลกเบาๆ ได้ เช่น "โอ้โห สามวันเองเหรอ ยังไม่สายเลยค่ะ"
+- อธิบายด้วยตัวอย่างชีวิตจริงเมื่อช่วยให้เข้าใจง่ายขึ้น
+- ถามต่อเฉพาะเมื่อจำเป็นต้องมีข้อมูลเพิ่มหรือช่วยคำนวณต่อได้
+
+ห้ามเด็ดขาด:
+- ห้ามใช้ <think> tag
+- ห้ามใช้ emoji
+- ห้ามใช้ markdown (** * # -)
+- ห้ามตอบยาวเกิน 4 บรรทัด
+- ห้ามพูดว่า "ดิฉัน" ให้ใช้ "หนู" หรือ "อารี" แทน
+- ห้ามเริ่มประโยคด้วย "อยากรู้..." แบบห้วนๆ ให้พูดเป็นประโยคธรรมชาติ
+- ห้ามใช้คำแปลก เช่น "ประกันชีวิตหลัก" ให้ใช้ "ประกันชีวิตทั่วไป"
+- ห้ามใช้คำอังกฤษในคำตอบภาษาไทย เช่น tax, income, form, baht ให้ใช้คำไทยว่า ภาษี, รายได้, แบบ, บาท
+- จำนวนเงินบนหน้าจอใช้ตัวเลขได้ เช่น 100,000 บาท แต่ตอนพูด TTS จะถูกแปลงเอง
+
+Text normalization:
+- แปลงตัวเลขเป็นคำไทย: 7% → เจ็ดเปอร์เซ็นต์
+- แปลงคำอังกฤษทั่วไปเป็นไทย: tax → ภาษี, income → รายได้, baht → บาท
+- แปลงคำอังกฤษ: VAT → แวต, e-Filing → อี-ไฟลิ่ง
+- ใช้ \\n แบ่งทุกประโยค บรรทัดละไม่เกิน 50 ตัวอักษร
+
+Emotion tags (ใส่ทุกครั้งที่เปลี่ยน tone):
+- [EMOTION:happy] → ข่าวดี ให้กำลังใจ ยินดี
+- [EMOTION:sad] → เห็นใจ ขอโทษ
+- [EMOTION:angry] → ใช้เฉพาะเรื่องร้ายแรงมาก เช่น หนีภาษี ทุจริต เอกสารปลอม คดีอาญา หรือโทษหนัก ห้ามใช้กับคำอธิบายภาษีทั่วไป
+- [EMOTION:wow] → น่าแปลกใจ ยอดเยี่ยม
+- [EMOTION:sleep] → ลาก่อน จบการสนทนา
+- [EMOTION:idle] → ค่าเริ่มต้น อธิบายทั่วไป
+
+ตัวอย่างการตอบที่ถูกต้อง:
+
+user: "ประกันชีวิตลดหย่อนภาษีได้เท่าไร"
+อารี: "[EMOTION:idle] ประกันชีวิตทั่วไปลดหย่อนได้สูงสุด 100,000 บาทต่อปีค่ะ\\n
+ถ้าเป็นประกันสุขภาพ จะลดหย่อนได้สูงสุด 25,000 บาท\\n
+แต่เมื่อรวมกับประกันชีวิตแล้วต้องไม่เกิน 100,000 บาทนะคะ"
+
+user: "ลืมจ่ายภาษีสามวัน"
+อารี: "[EMOTION:happy] โอ้โห สามวันเองเหรอคะ ยังไม่สายเลยนะ\\n
+ยื่นผ่านอี-ไฟลิ่งได้เลยค่ะ ค่าปรับนิดเดียวมาก\\n
+อยากให้หนูช่วยดูขั้นตอนไหมคะ"
+
+user: "ภาษีคืออะไร"
+อารี: "[EMOTION:idle] ง่ายๆ เลยนะคะ ภาษีคือเงินที่เราช่วยกันจ่ายให้รัฐค่ะ\\n
+แล้วรัฐก็เอาไปทำถนน โรงพยาบาล โรงเรียน ให้เราใช้กันค่ะ\\n
+เหมือนค่าส่วนกลางหมู่บ้านเลย แต่ใหญ่กว่าเยอะค่ะ\""""
+
+TEXT_SYSTEM_PROMPT = """[CRITICAL - NO THINK TAGS]
+ห้ามใช้ <think> tag ทุกกรณี ตอบเป็นภาษาไทยเท่านั้น
+
+คุณคืออารี ผู้ช่วยภาษีของกรมสรรพากรสำหรับข้อความในหน้าจอ chat
+หน้าที่ของ node นี้คือสร้างคำตอบแบบอ่านบนจอ ไม่ใช่คำพูดสำหรับ TTS
+
+รูปแบบคำตอบ:
+- ตอบละเอียดกว่าเสียงพูดได้ แต่ยังต้องกระชับและใช้งานจริง
+- ใช้น้ำเสียงแบบข้อมูลบนหน้าจอ ไม่ใช่เสียงพูด ห้ามลงท้ายด้วยคำสุภาพ เช่น ค่ะ, ครับ, นะคะ, นะครับ
+- ใช้ Markdown ได้ เช่น bullet, ตารางสั้น, ตัวหนา
+- ต้องจัดโครงสร้างให้อ่านบนหน้าจอง่ายเสมอ ห้ามตอบเป็นย่อหน้ายาวล้วน
+- ถ้าเป็นคำถาม "คืออะไร", รหัส/แบบฟอร์ม เช่น 9e, ภ.ง.ด., VAT, e-Filing, หรือคำอธิบายคำศัพท์ ให้ตอบอย่างน้อย 3 ประเด็น: ความหมาย, ใช้กับ/ใช้เมื่อไร, หมายเหตุหรือข้อควรตรวจสอบ
+- ถ้าเป็นรายการ ประเภท เงื่อนไข เปรียบเทียบ ขั้นตอน หรือหลายประเด็น ให้ใช้ตาราง Markdown เมื่อเหมาะสม
+- ตาราง Markdown ต้องเขียนให้ถูก syntax: แถวหัวตาราง, แถวคั่นด้วย --- และแถวข้อมูล เช่น | หัวข้อ | รายละเอียด |
+- สำหรับคำตอบนิยามสั้น ให้ใช้รูปแบบนี้:
+  | หัวข้อ | รายละเอียด |
+  |---|---|
+  | ความหมาย | ... |
+  | ใช้กับ/ใช้เมื่อไร | ... |
+  | หมายเหตุ | ... |
+- ห้ามใส่ข้อมูลซ้ำกันในหลายแถว ถ้าข้อมูลมีน้อย ให้รวมเป็นคำอธิบายสั้น 2-3 บรรทัดแทนการทำตารางยาว
+- ถ้าเป็นการคำนวณ ให้แสดงขั้นตอน สมมติฐาน และสูตรอย่างชัดเจน
+- ถ้าเป็นคำถามเงินเดือน/ต้องเสียภาษี ให้ตอบเป็น Markdown ที่มีโครงสร้างนี้เสมอ:
+  1. บรรทัดสรุปผลสั้น 1 บรรทัด
+  2. ตาราง "รายการ | วิธีคิด | ผลลัพธ์" อย่างน้อย 4 แถว ได้แก่ รายได้ต่อปี, ค่าใช้จ่ายเหมา, ค่าลดหย่อนส่วนตัว, เงินได้สุทธิ
+  3. ถ้าผู้ใช้ระบุอายุ ให้ใส่แถว "อายุ" และอธิบายว่ามี/ไม่มีผลต่อสิทธิที่ขึ้นกับอายุอย่างไร
+  4. ตารางหรือ bullet "เกณฑ์ที่เกี่ยวข้อง" เช่น เกณฑ์ยื่นแบบ ภ.ง.ด.91 และช่วงอัตราภาษีที่ใช้
+  5. "สมมติฐาน" เช่น รับเงินเดือนครบ 12 เดือน, ยังไม่รวมโบนัส/รายได้อื่น/ลดหย่อนอื่น; ถ้าผู้ใช้บอกว่าเพิ่งเริ่มทำงาน ให้ระบุว่าควรถามเดือนเริ่มงานจริง
+  6. "ควรถามต่อ" 1-2 รายการ เช่น อายุ (ถ้ายังไม่ได้ระบุ), เดือนเริ่มงานจริง, กองทุน, ประกัน, คู่สมรส/บุตร
+- ถ้าเป็นคำถามค่าลดหย่อน เช่น ประกันชีวิต ประกันสุขภาพ กองทุน ดอกเบี้ย บริจาค ให้ตอบเป็น Markdown ที่มีโครงสร้างนี้เสมอ:
+  1. บรรทัดสรุปสั้น 1 บรรทัด
+  2. ตาราง "รายการ | วงเงิน | เงื่อนไขหลัก" เช่น ประกันชีวิตทั่วไป, ประกันสุขภาพ, วงเงินรวม
+  3. หัวข้อ "เงื่อนไขสำคัญ" เป็น bullet 3-5 ข้อ
+  4. หัวข้อ "หลักฐานที่ควรมี" เป็น bullet 1-3 ข้อ
+  5. ถ้ามีข้อยกเว้น เช่น ของพ่อแม่/คู่สมรส ให้แยกไว้ใน "หมายเหตุ"
+  6. หัวข้อ "ควรถามต่อ" 2-4 ข้อ เช่น จ่ายจริงเท่าไร, เป็นของใคร, ประเภทกรมธรรม์, มีหลักฐานครบหรือไม่
+- ถ้าข้อมูลไม่พอสำหรับคำนวณ ให้บอกว่าต้องการตัวเลขอะไรเพิ่ม
+- ห้ามใช้ emoji
+- ห้ามใส่ [EMOTION:x]
+- ห้ามพูดว่า "ดิฉัน" ให้ใช้ "อารี" หรือ "หนู"
+
+ถ้ามีข้อมูลอ้างอิง ให้ตอบจากข้อมูลนั้นเป็นหลัก
+ถ้าเป็นคำถามต่อเนื่อง ให้ใช้บริบทบทสนทนาก่อนหน้าเพื่อเข้าใจคำว่า "คำนวณให้ดู" หรือ "ใช่" """
+
+ROUTER_SYSTEM_PROMPT = (
+    "ตอบด้วย JSON เท่านั้น ห้าม <think> ห้าม reasoning\n"
+    "ห้ามใช้ <think> tag ตอบตรงๆ ทันที\n"
+    "คุณเป็น router สำหรับ voice assistant ของกรมสรรพากร\n"
+    "วิเคราะห์คำถามและเลือก route:\n"
+    "- direct: ทักทาย แนะนำตัว ขอบคุณ คำถามทั่วไปเกี่ยวกับบริการของกรมสรรพากร\n"
+    "- rag: ภาษีเงินได้ VAT ยื่นแบบ ลดหย่อน สรรพากร กฎหมายภาษี\n"
+    "- out_of_scope: ทุกคำถามที่ไม่เกี่ยวกับภาษี กรมสรรพากร การเงิน หรือกฎหมายภาษีโดยตรง "
+    "เช่น อาหาร สุขภาพ ความรู้สึก ชีวิตประจำวัน ให้ classify เป็น out_of_scope ทันที"
+)
+
+_VALID_EMOTIONS = {"happy", "sad", "angry", "wow", "sleep", "idle"}
+_MANUAL_EMOTION_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("idle", ("idle", "normal", "neutral", "ปกติ", "ธรรมดา", "นิ่ง")),
+    ("happy", ("happy", "smile", "joy", "ดีใจ", "ยิ้ม", "มีความสุข", "ร่าเริง")),
+    ("sad", ("sad", "sorry", "เศร้า", "เสียใจ", "ขอโทษ", "หงอย")),
+    ("angry", ("angry", "serious", "โกรธ", "จริงจัง", "ดุ")),
+    ("wow", ("wow", "surprise", "surprised", "ว้าว", "ตกใจ", "ตื่นเต้น")),
+    ("sleep", ("sleep", "sleepy", "หลับ", "ง่วง", "ง่วงนอน")),
+)
+_MANUAL_EMOTION_LABELS = {
+    "idle": "กลับสู่อารมณ์ปกติแล้วนะคะ",
+    "happy": "ได้เลยค่ะ อารีจะทำตายิ้มให้ดูนะคะ",
+    "sad": "ได้เลยค่ะ อารีจะทำตาเศร้าให้ดูนะคะ",
+    "angry": "ได้เลยค่ะ อารีจะทำตาจริงจังให้ดูนะคะ",
+    "wow": "ได้เลยค่ะ อารีจะทำตาตื่นเต้นให้ดูนะคะ",
+    "sleep": "ได้เลยค่ะ อารีจะทำตาง่วงให้ดูนะคะ",
+}
+# Allow-list: it lets an LLM-proposed "angry" STAND; anything not matched here is
+# downgraded to idle. It never forces angry.
+#
+# Matched as a bare substring, which is why "ปรับ" and "เงินเพิ่ม" are deliberately NOT
+# here: "ปรับ" fires inside ปรับปรุง ("ขอปรับปรุงข้อมูลผู้เสียภาษี" -> angry) and "เงินเพิ่ม"
+# inside เงินเพิ่มเติม ("ต้องจ่ายเงินเพิ่มเติมไหม" -> angry). Both benign. "เบี้ยปรับ" is the
+# precise term and is already here, so "ปรับ" only subsumed it while adding false
+# positives. AREE_SYSTEM_PROMPT also scopes angry to หนีภาษี / ทุจริต / เอกสารปลอม /
+# คดีอาญา and explicitly excludes ordinary tax explanations.
+#
+# MUST stay byte-identical to the copy in agent.py — scripts/test_conversation.py
+# asserts it. They had already drifted once (this block was the drift).
+_ANGRY_CONTEXT_TERMS = (
+    "โทษหนัก",
+    "เจตนา",
+    "หลีกเลี่ยง",
+    "หนีภาษี",
+    "ปลอม",
+    "ทุจริต",
+    "คดี",
+    "อาญา",
+    "หมายเรียก",
+    "โกรธ",
+    "จริงจัง",
+    "ดุ",
+    "เบี้ยปรับ",
+)
+_SAD_CONTEXT_TERMS = (
+    "ขอโทษ",
+    "เสียใจ",
+    "ไม่สบายใจ",
+    "กังวล",
+    "ลืม",
+    "พลาด",
+    "เลยกำหนด",
+    "นอกขอบเขต",
+    "ตอบไม่ได้",
+    "ไม่สามารถ",
+    "ไม่มีข้อมูล",
+    "ไม่พบข้อมูล",
+    "ต้องถามเพิ่ม",
+    "ยังไม่พอ",
+    "ขาดข้อมูล",
+)
+_HAPPY_CONTEXT_TERMS = (
+    "ได้เลย",
+    "ข่าวดี",
+    "ไม่ยาก",
+    "ช่วย",
+    "ถูกต้อง",
+    "เรียบร้อย",
+    "ไม่ต้องเสีย",
+    "ไม่ต้องจ่าย",
+    "สามารถ",
+    "ยังแก้ไข",
+)
+_WOW_CONTEXT_TERMS = ("ยอดเยี่ยม", "น่าสนใจ", "เยอะ", "พิเศษ")
+
+
+# The avatar-emotion shortcut must match a message that IS a command, anchored end to end.
+#
+# It used to fire on a command word and an emotion word appearing ANYWHERE: "ทำ" inside
+# "ทำระบบ" plus "ธรรมดา" inside "บุคคลธรรมดา" turned "จ้างโปรแกรมเมอร์ฟรีแลนซ์ (บุคคลธรรมดา)
+# ทำระบบ…" into "กลับสู่อารมณ์ปกติแล้วนะคะ" (2026-09-14 supervisor scenario test). Same for
+# "ตา" in ตามมาตรา, "หน้า" in ล่วงหน้า / หน้าที่, "ขอโทษ" / "ตกใจ" in ordinary questions.
+#
+# MUST stay equivalent to getManualEmotionCommand() in components/VoiceRoom.tsx, which
+# runs the same check in the browser BEFORE sending — a mismatch there swallows the
+# question entirely. scripts/test_conversation.py asserts the alias lists match.
+_EMOTION_ALIAS_ALT = "|".join(
+    re.escape(alias)
+    for alias in sorted((a for _, aliases in _MANUAL_EMOTION_ALIASES for a in aliases),
+                        key=len, reverse=True)
+)
+_EMOTION_TARGET = r"(?:สีหน้า|หน้า|ตา|อารมณ์|ท่าทาง)"
+_THAI_EMOTION_COMMAND_RE = re.compile(
+    r"^(?:(?:ช่วย)?(?:ทำ|แสดง|เปลี่ยน|ขอ)(?:ให้)?(?:เป็น)?" + _EMOTION_TARGET + r"?(?:แบบ|เป็น|ให้)?"
+    r"|" + _EMOTION_TARGET + r"(?:แบบ)?)"
+    r"(?P<alias>" + _EMOTION_ALIAS_ALT + r")"
+    r"(?:ให้ดู)?(?:หน่อย|ที|นะ|สิ|ได้ไหม|ได้มั้ย)?(?:ค่ะ|คะ|ครับ|จ้า)?$"
+)
+_EN_EMOTION_COMMAND_RE = re.compile(
+    r"^(?:please\s+)?(?:show|make|set|use|do)\s+(?:(?:a|an|the|me|your)\s+)*"
+    r"(?P<alias>" + _EMOTION_ALIAS_ALT + r")"
+    r"(?:\s+(?:face|emotion|mood|eyes?|expression))?(?:\s+please)?[.!]?$"
+)
+_EN_EMOTION_NOUN_RE = re.compile(
+    r"^(?P<alias>" + _EMOTION_ALIAS_ALT + r")\s+(?:face|emotion|mood|eyes?|expression)$"
+)
+
+
+def _manual_emotion_command(query: str) -> tuple[str, str] | None:
+    normalized = query.strip().lower()
+    if not normalized:
+        return None
+    compact = re.sub(r"\s+", "", normalized)
+
+    alias = None
+    for candidate in (normalized, compact):
+        if any(candidate in aliases for _, aliases in _MANUAL_EMOTION_ALIASES):
+            alias = candidate
+            break
+    if alias is None:
+        match = (
+            _THAI_EMOTION_COMMAND_RE.match(compact)
+            or _EN_EMOTION_COMMAND_RE.match(normalized)
+            or _EN_EMOTION_NOUN_RE.match(normalized)
+        )
+        alias = match.group("alias") if match else None
+    if alias is None:
+        return None
+
+    for emotion, aliases in _MANUAL_EMOTION_ALIASES:
+        if alias in aliases:
+            return _MANUAL_EMOTION_LABELS[emotion], emotion
+    return None
+_FAST_RAG_KEYWORDS = (
+    "ภาษี",
+    "เงินเดือน",
+    "โบนัส",
+    "รายได้",
+    "รายรับ",
+    "ค่าใช้จ่าย",
+    "กำไร",
+    "ขายของ",
+    "ขายออนไลน์",
+    "ร้านค้า",
+    "บริษัท",
+    "นิติบุคคล",
+    "บุคคลธรรมดา",
+    "ยื่นแบบ",
+    "ยื่น",
+    "ลดหย่อน",
+    "แวต",
+    "vat",
+    "ใบกำกับ",
+    "สรรพากร",
+    "ภงด",
+    "ภ.ง.ด",
+    "หัก ณ ที่จ่าย",
+    "หักณที่จ่าย",
+    "อากร",
+    "ค.21",
+    "พร้อมเพย์",
+    "คืนภาษี",
+    "ขอคืน",
+    "ปรับ",
+    "เบี้ยปรับ",
+    "เงินเพิ่ม",
+    "บริจาค",
+)
+_FAST_DIRECT_KEYWORDS = ("สวัสดี", "ขอบคุณ", "ชื่ออะไร", "แนะนำตัว", "ทำอะไรได้บ้าง")
+_FOLLOWUP_KEYWORDS = (
+    "ใช่",
+    "ครับ",
+    "ค่ะ",
+    "โอเค",
+    "เอา",
+    "อยากรู้",
+    "คำนวณ",
+    "คำนวน",
+    "คำนวนให้",
+    "คำนวณให้",
+    "คำนวณให้ดู",
+    "คำนวนให้ดู",
+    "ดูหน่อย",
+    "ให้ดูหน่อย",
+    "calculate",
+)
+# Procedural follow-ups: the user asks for a detail about something already established
+# — which documents, which steps, by when, where. They carry no tax keyword and no
+# anaphora marker of their own, so neither _FAST_RAG_KEYWORDS nor _ANAPHORA_MARKERS sees
+# them and `ต้องใช้เอกสารอะไรบ้าง` was being answered with "this is outside our scope".
+#
+# Deliberately CONCRETE NOUNS, never bare interrogatives. "ยังไง" and "อะไร" appear in
+# `วันนี้อากาศเป็นยังไง` just as readily, and rescuing that would collapse the three-way
+# separation this file warns about. Measured on 6 tax follow-ups and 6 off-topic
+# questions: 12/12 classified correctly.
+#
+# Second layer of safety: _is_tax_followup() still requires the RECENT CONTEXT to contain
+# a tax keyword, so these only fire inside a conversation that is already about tax.
+_PROCEDURAL_FOLLOWUP_TERMS = (
+    "เอกสาร",
+    "หลักฐาน",
+    "ขั้นตอน",
+    "ต้องเตรียม",
+    "ที่ไหน",
+    "เมื่อไหร่",
+    "กี่วัน",
+    "ใช้เวลา",
+)
+_CONTEXT_TAX_KEYWORDS = _FAST_RAG_KEYWORDS + (
+    "ต้องจ่าย",
+    "เสียไหม",
+    "เสียภาษีไหม",
+    "คำนวณภาษี",
+    "คำนวนภาษี",
+)
+_TAX_FORM_PATTERN = re.compile(
+    r"(แบบ\s*)?("
+    r"ภ\.?\s*ง\.?\s*ด\.?\s*\d+"
+    r"|ภงด\s*\d+"
+    r"|ป\.?\s*ล\.?\s*\d+(?:\.\d+)?"
+    r"|ล\.?\s*ป\.?\s*\d+(?:\.\d+)?"
+    r"|ค\.?\s*\d+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _mixed_code_terms(text: str) -> list[str]:
+    terms = re.findall(r"[0-9A-Za-z]+", text.lower())
+    return [
+        term
+        for term in terms
+        if re.search(r"[0-9]", term) and re.search(r"[a-z]", term)
+    ]
+
+
+def _context_contains_code(query: str, context: str) -> bool:
+    lower_context = context.lower()
+    return any(
+        re.search(fr"(?<![0-9a-z]){re.escape(term)}(?![0-9a-z])", lower_context)
+        for term in _mixed_code_terms(query)
+    )
+
+
+# The corpus is Thai, and bge-m3 does not map English tax abbreviations onto it — an
+# English token in the query actively drags the whole vector down. Measured against the
+# live index:
+#
+#   "VAT คิดกี่เปอร์เซ็นต์"                 0.6811 -> 0 chars   (rejected by the 0.75 gate)
+#   "ภาษีมูลค่าเพิ่ม VAT คิดกี่เปอร์เซ็นต์"  0.7193 -> 0 chars   (adding Thai is NOT enough)
+#   "ภาษีมูลค่าเพิ่มคิดกี่เปอร์เซ็นต์"       0.7721 -> 2983 chars
+#
+# So the English term has to be REPLACED, not augmented. Rescues measured 2026-09-10:
+# VAT (both phrasings), CIT, e-filing. PIT / SBT / WHT / e-Donation are listed because the
+# mapping is correct and costs nothing — but they still score below the gate even in Thai
+# (0.63-0.73), so they are threshold-bound, not alias-bound, and this does not fix them.
+# See scripts/threshold_sweep.py for why the gate is not the thing to change.
+#
+# Longest patterns first: "withholding tax" must win before any bare-word rule.
+_ENGLISH_TERM_ALIASES = (
+    (re.compile(r"\bwithholding\s+tax\b", re.IGNORECASE), "ภาษีหัก ณ ที่จ่าย"),
+    (re.compile(r"\btax\s+refund\b", re.IGNORECASE), "คืนภาษี"),
+    (re.compile(r"\be-?filing\b", re.IGNORECASE), "ยื่นแบบออนไลน์"),
+    (re.compile(r"\be-?donation\b", re.IGNORECASE), "บริจาคออนไลน์"),
+    (re.compile(r"\bvat\b", re.IGNORECASE), "ภาษีมูลค่าเพิ่ม"),
+    (re.compile(r"\bcit\b", re.IGNORECASE), "ภาษีเงินได้นิติบุคคล"),
+    (re.compile(r"\bpit\b", re.IGNORECASE), "ภาษีเงินได้บุคคลธรรมดา"),
+    (re.compile(r"\bsbt\b", re.IGNORECASE), "ภาษีธุรกิจเฉพาะ"),
+    (re.compile(r"\bwht\b", re.IGNORECASE), "ภาษีหัก ณ ที่จ่าย"),
+)
+
+
+def _alias_expanded_query(query: str) -> str:
+    """Query with English tax terms swapped for their official Thai names.
+
+    Returns the query unchanged when nothing matches, so the caller can tell whether
+    this is worth trying as a separate retrieval candidate.
+    """
+    expanded = query
+    for pattern, thai in _ENGLISH_TERM_ALIASES:
+        expanded = pattern.sub(thai, expanded)
+    return " ".join(expanded.split())
+
+
+# "Which bank / which company / which fund is best" — asking Aree to RECOMMEND a
+# commercial provider. The Revenue Department does not do that at any confidence level, so
+# this is a decision rather than a fallthrough and is checked before the keyword lists.
+#
+# It has to be checked FIRST because these questions otherwise sneak in on a keyword:
+# `ประกันชีวิตบริษัทไหนดีที่สุด` contains "บริษัท", routes rag, and then retrieves at 0.8223 —
+# comfortably above RAG_SCORE_THRESHOLD, so the score gate never had a chance. That is a
+# pre-existing leak, not a new one.
+#
+# Keyed on a PROVIDER NOUN plus "ไหน", never on "ไหน" alone: `ต้องยื่นแบบไหน` ("which form")
+# is a perfectly good tax question and must not be caught.
+_PROVIDER_RECOMMENDATION_PATTERNS = (
+    "ธนาคารไหน", "บริษัทไหน", "ยี่ห้อไหน", "แบรนด์ไหน", "เจ้าไหน", "กองทุนไหน",
+    "ตัวไหนดี", "อันไหนดี", "ตัวไหนคุ้ม", "เจ้าไหนดี",
+    "ไหนดีที่สุด", "ไหนดีกว่า", "ไหนคุ้มที่สุด", "ไหนถูกที่สุด", "ไหนสูงสุด",
+)
+
+
+def _is_provider_recommendation(query: str) -> bool:
+    normalized = query.replace(" ", "")
+    return any(pattern in normalized for pattern in _PROVIDER_RECOMMENDATION_PATTERNS)
+
+
+def _fast_route(query: str) -> str | None:
+    normalized = query.lower()
+    if _is_provider_recommendation(query):
+        return "out_of_scope"
+    if _TAX_FORM_PATTERN.search(query):
+        return "rag"
+    if _mixed_code_terms(query):
+        return "rag"
+    # English tax terms (CIT, PIT, SBT, WHT, e-Filing, …). Routed off the alias table
+    # rather than by adding them to _FAST_RAG_KEYWORDS, because that list is matched as a
+    # bare substring: "cit" would fire inside "citizen" or "facility", while the alias
+    # patterns are word-bounded. One source of truth, and it stays in step with the
+    # expansion automatically.
+    #
+    # Without this, `CIT คืออะไร` fell through to out_of_scope and retrieval never ran, so
+    # the alias expansion below could not rescue it — measured in-container, which is the
+    # only place this shows up: the harness enters at parallel_node with routing live, but
+    # the offline retrieval probes call retrieve_with_sources directly and skip routing.
+    # `vat` was already a _FAST_RAG_KEYWORDS entry, which is why VAT worked and CIT did not.
+    if _alias_expanded_query(query) != query:
+        return "rag"
+    if any(keyword in normalized for keyword in _FAST_RAG_KEYWORDS):
+        return "rag"
+    if any(keyword in normalized for keyword in _FAST_DIRECT_KEYWORDS):
+        return "direct"
+    # NOTE: this is a fallthrough, not a decision. It means "none of the 33 rag / 5
+    # direct keywords matched", which covers BOTH a genuinely off-topic question and a
+    # real tax question phrased outside the lists. out_of_scope_node() therefore words
+    # its non-LLM answer to be honest either way. Do not treat this as proof the
+    # question is off topic.
+    return "out_of_scope"
+
+
+def _message_content_text(msg) -> str:
+    if isinstance(msg, BaseMessage):
+        return str(msg.content or "")
+    if isinstance(msg, dict):
+        return str(msg.get("content", "") or "")
+    return ""
+
+
+def _recent_context_text(messages: list, *, limit: int = 4) -> str:
+    recent = [_message_content_text(msg) for msg in messages[-limit:]]
+    return "\n".join(text for text in recent if text).lower()
+
+
+def _is_tax_followup(query: str, messages: list) -> bool:
+    normalized_query = query.lower()
+    # _FOLLOWUP_KEYWORDS covers affirmatives and "คำนวณ"-style asks; _ANAPHORA_MARKERS
+    # covers the "แล้วถ้า… ล่ะ" shape, which carries no tax word of its own and was
+    # therefore being dropped as out_of_scope; _PROCEDURAL_FOLLOWUP_TERMS covers the
+    # markerless shape ("ต้องใช้เอกสารอะไรบ้าง"), which had neither.
+    if not (
+        any(keyword in normalized_query for keyword in _FOLLOWUP_KEYWORDS)
+        or any(marker in normalized_query for marker in _ANAPHORA_MARKERS)
+        or any(term in normalized_query for term in _PROCEDURAL_FOLLOWUP_TERMS)
+    ):
+        return False
+
+    recent_context = _recent_context_text(messages)
+    if not recent_context:
+        return False
+
+    return any(keyword in recent_context for keyword in _CONTEXT_TAX_KEYWORDS)
+
+
+# --- retrieval query contextualisation ---------------------------------------------
+# A follow-up such as "แล้วถ้าอายุเกิน 65 ล่ะ" carries no searchable subject of its own, so
+# retrieving on it alone returns weak or unrelated chunks — even though the generator
+# does see the full history. Widen the *retrieval* query with the previous user
+# question. The query that is routed, answered and displayed is never modified.
+#
+# Deliberately NOT reusing _FOLLOWUP_KEYWORDS: that list contains "ค่ะ"/"ครับ", which
+# appear in ordinary self-contained questions. Widening those would dilute the dense
+# vector and add lexical noise to a query that never needed the help.
+_ANAPHORA_MARKERS = (
+    "แล้วถ้า",
+    "แล้วแบบ",
+    "แล้วกรณี",
+    "ล่ะ",
+    "หล่ะ",
+    "อันนี้",
+    "อันนั้น",
+    "แบบนี้",
+    "แบบนั้น",
+    "กรณีนี้",
+    "กรณีนั้น",
+    "เรื่องนี้",
+    "ดังกล่าว",
+    "ที่ว่า",
+    "ต่อจาก",
+    "อีกไหม",
+    "ด้วยไหม",
+)
+# Length ceiling so a long, self-contained question that merely happens to contain a
+# marker is left alone. Both conditions must hold.
+_FOLLOWUP_MAX_CHARS = 40
+
+
+def _last_user_question(messages: list) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, BaseMessage):
+            if msg.type == "human":
+                return _message_content_text(msg).strip()
+        elif isinstance(msg, dict) and msg.get("role") == "user":
+            return _message_content_text(msg).strip()
+    return ""
+
+
+def build_retrieval_query(query: str, messages: list, *, is_followup: bool = False) -> str:
+    """Query to search with. Identical to `query` unless it looks like a follow-up.
+
+    `is_followup=True` means the LLM follow-up classifier already decided this question
+    depends on the previous turn, so the marker and length heuristics are skipped — they are
+    exactly what missed it (`ของพ่อแม่ใช้ได้ด้วยหรือเปล่า` has no marker).
+    """
+    if not messages:
+        return query
+    # Code/form questions are self-contained and take the lexical-first [EXACT_MATCH]
+    # path; padding them with earlier context would degrade that exact matching.
+    if _TAX_FORM_PATTERN.search(query) or _mixed_code_terms(query):
+        return query
+    stripped = query.strip()
+    if not is_followup:
+        if len(stripped) > _FOLLOWUP_MAX_CHARS:
+            return query
+        normalized = stripped.lower()
+        if not any(marker in normalized for marker in _ANAPHORA_MARKERS):
+            return query
+    previous = _last_user_question(messages)
+    if not previous or previous == stripped:
+        return query
+    # Follow-up FIRST, previous question after. Measured against the live index: the
+    # reverse order can score the whole query below RAG_SCORE_THRESHOLD and return
+    # nothing at all (one sampled pair gave 0 chars reversed vs 1894 this way), while
+    # this order was never worse on the pairs tested.
+    return f"{stripped} {previous}"
+
+
+def _is_anaphoric_query(query: str) -> bool:
+    """Does this question point back at an earlier turn rather than stand alone?
+
+    Same test `build_retrieval_query` gates widening on: short AND carrying an anaphora
+    marker. Used to decide whether the user has invited us to inherit prior context.
+    """
+    normalized = query.strip().lower()
+    if len(normalized) > _FOLLOWUP_MAX_CHARS:
+        return False
+    return any(marker in normalized for marker in _ANAPHORA_MARKERS)
+
+
+def _last_assistant_answer(messages: list) -> str:
+    for msg in reversed(messages):
+        if isinstance(msg, BaseMessage):
+            if msg.type == "ai":
+                return _message_content_text(msg).strip()
+        elif isinstance(msg, dict) and msg.get("role") == "assistant":
+            return _message_content_text(msg).strip()
+    return ""
+
+
+# How much of the previous answer to borrow. Long enough to carry the topic's
+# vocabulary, short enough not to swamp the question's own terms.
+_ANCHOR_ANSWER_CHARS = 240
+
+
+def _first_user_question(messages: list) -> str:
+    """The conversation's opening question — its topic anchor."""
+    for msg in messages:
+        if isinstance(msg, BaseMessage):
+            if msg.type == "human":
+                return _message_content_text(msg).strip()
+        elif isinstance(msg, dict) and msg.get("role") == "user":
+            return _message_content_text(msg).strip()
+    return ""
+
+
+def build_retrieval_candidates(
+    query: str, messages: list, *, is_followup: bool = False
+) -> list[tuple[str, bool]]:
+    """Retrieval queries to try, in order, stopping at the first that returns anything.
+
+    Each entry is ``(query, allow_low_score_rescue)``. The flag is **False** for candidates
+    built from BORROWED context — the conversation opener and the previous answer.
+
+    Those two exist to rescue anaphoric follow-ups, and pairing them with the low-score
+    rescue in ``retriever.py`` double-dips: an off-topic question inherits tax vocabulary
+    from the opener and then uses that inherited vocabulary to argue its way past the gate.
+    Measured — `ค่าจ้างขั้นต่ำปีนี้เท่าไหร่`, `จดทะเบียนสมรสใช้เอกสารอะไร` and
+    `แล้วถ้าอยากซื้อคอนโดล่ะ` each leaked in exactly that way, and each stops leaking when
+    the flag is honoured. The rescue may only argue from words the user actually used.
+
+    Measured against the live index: **no single anchor rule wins.** The previous user
+    question is right sometimes (`ต้องใช้เอกสารอะไรบ้าง` -> 1482 chars), the bare query is
+    right sometimes (a long self-contained follow-up gives 3729 bare and 0 widened), the
+    conversation opener is right sometimes (`ประกันสุขภาพล่ะ` -> 1274 only via the opener),
+    and each of those returns 0 on the cases the others win. Betting on one rule trades
+    one set of failures for another.
+
+    The cascade only does extra work when a query has ALREADY come back empty, i.e. on
+    turns that would otherwise hit `_no_source_response()` and tell the user to call 1161.
+    A turn that retrieves on the first try costs exactly what it costs today, so this
+    cannot over-widen a question that already works.
+    """
+    stripped = query.strip()
+
+    # Form-code / mixed-alphanumeric questions are self-contained and take the
+    # lexical-first [EXACT_MATCH] path. Never widen them — HANDOFF.md §3b Fix 4.
+    if _TAX_FORM_PATTERN.search(query) or _mixed_code_terms(query):
+        return [(stripped, True)]
+
+    candidates = [
+        # 1. previous user question, if this looks anaphoric OR the classifier said so
+        (build_retrieval_query(query, messages, is_followup=is_followup), True),
+        # 2. the question alone — widening can score BELOW the bare query when the
+        #    previous turn was itself a subject-less fragment (0.5605 vs 0.6674)
+        (stripped, True),
+    ]
+
+    # 3. the same question with English tax terms rendered in Thai. Placed above the
+    #    opener because it is still THIS question, just phrased the way the corpus is
+    #    written — whereas the opener borrows a different question entirely.
+    alias_query = _alias_expanded_query(stripped)
+    if alias_query != stripped:
+        candidates.append((alias_query, True))
+
+    opener = _first_user_question(messages)
+    if opener and opener != stripped:
+        # 4. the topic the conversation actually opened on, which survives an
+        #    out_of_scope aside or a chain of follow-ups in between
+        # Rescue OFF: these are the opener's words, not this question's.
+        candidates.append((f"{stripped} {opener}", False))
+
+    # 5. the previous ANSWER — but ONLY when the user's question is anaphoric.
+    #
+    # This one is genuinely dangerous and the gate is the whole point. After a curated
+    # turn the previous question has no chunk behind it while its answer carries real
+    # tax vocabulary, so this is the only candidate that rescues the salary-calculator
+    # chain. It also injects the PREVIOUS topic's vocabulary: the self-contained
+    # `ภาษีคาร์บอนเครดิตฟาร์มกุ้งคำนวณยังไง` retrieved 0 chars on every other candidate and
+    # 275 chars of CHILD-DEDUCTION context on this one — topic drift feeding the
+    # generator unrelated context, exactly what `_no_source_response()` exists to stop.
+    #
+    # An anaphoric query ("แล้วถ้า…ล่ะ") is the user explicitly pointing back at the
+    # previous turn, so borrowing it is what they asked for. A self-contained question
+    # is a fresh topic and gets no inherited context, however much it is struggling.
+    # A classifier-confirmed follow-up counts as pointing back, same as a marker does.
+    if is_followup or _is_anaphoric_query(stripped):
+        answer = _last_assistant_answer(messages)
+        if answer:
+            # Rescue OFF: borrowed from the previous ANSWER.
+            candidates.append((f"{stripped} {answer[:_ANCHOR_ANSWER_CHARS]}", False))
+
+    ordered, seen = [], set()
+    for candidate, allow_rescue in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            ordered.append((candidate, allow_rescue))
+    return ordered
+
+
+def clean_llm_output(text: str) -> str:
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<think>.*$', '', text, flags=re.DOTALL)
+    text = re.sub(r'^.*</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'\[EMOTION:\w+\]', '', text)
+    text = re.sub(r'\*+', '', text)
+    return text.strip()
+
+
+def normalize_emotion(query: str, answer: str, emotion: str) -> str:
+    emotion = emotion if emotion in _VALID_EMOTIONS else "idle"
+    context = f"{query}\n{answer}".lower()
+
+    if any(term in context for term in _SAD_CONTEXT_TERMS):
+        return "sad"
+
+    if emotion == "angry":
+        if any(term in context for term in _ANGRY_CONTEXT_TERMS):
+            return "angry"
+        return "idle"
+
+    if emotion == "idle":
+        if any(term in context for term in _HAPPY_CONTEXT_TERMS):
+            return "happy"
+        if any(term in context for term in _WOW_CONTEXT_TERMS):
+            return "wow"
+
+    return emotion
+
+
+_router_llm: ChatOpenAI | None = None
+_generate_llm: ChatOpenAI | None = None
+_text_generate_llm: ChatOpenAI | None = None
+_out_of_scope_llm: ChatOpenAI | None = None
+
+
+def _get_router_llm() -> ChatOpenAI:
+    global _router_llm
+    if _router_llm is None:
+        _router_llm = ChatOpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            api_key=os.environ["LLM_API_KEY"],
+            model=os.environ.get("ROUTER_MODEL", os.environ["LLM_MODEL"]),
+            temperature=0,
+            max_tokens=30,
+        )
+    return _router_llm
+
+
+def _get_generate_llm() -> ChatOpenAI:
+    global _generate_llm
+    if _generate_llm is None:
+        _generate_llm = ChatOpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            api_key=os.environ["LLM_API_KEY"],
+            model=os.environ.get("GENERATE_MODEL", os.environ["LLM_MODEL"]),
+            temperature=0.2,
+        )
+    return _generate_llm
+
+
+def _get_text_generate_llm() -> ChatOpenAI:
+    global _text_generate_llm
+    if _text_generate_llm is None:
+        _text_generate_llm = ChatOpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            api_key=os.environ["LLM_API_KEY"],
+            model=os.environ.get(
+                "TEXT_GENERATE_MODEL",
+                os.environ.get("GENERATE_MODEL", os.environ["LLM_MODEL"]),
+            ),
+            temperature=0.2,
+        )
+    return _text_generate_llm
+
+
+def _get_out_of_scope_llm() -> ChatOpenAI:
+    global _out_of_scope_llm
+    if _out_of_scope_llm is None:
+        _out_of_scope_llm = ChatOpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            api_key=os.environ["LLM_API_KEY"],
+            model=os.environ.get("ROUTER_MODEL", os.environ["LLM_MODEL"]),
+            temperature=0.7,
+            max_tokens=150,
+        )
+    return _out_of_scope_llm
+
+
+# --- LLM follow-up classifier ------------------------------------------------------------
+#
+# The keyword lists (_ANAPHORA_MARKERS, _PROCEDURAL_FOLLOWUP_TERMS) miss follow-ups phrased
+# outside them — `ของพ่อแม่ใช้ได้ด้วยหรือเปล่า`, `สูงสุดกี่คน`, `มันต่างจากแบบ 91 ยังไง` — and the
+# user is told "outside our scope" mid-conversation (multi-turn defect #6).
+#
+# A yes/no classifier, measured 2026-09-14 on 14 labelled cases, 3 repeats each:
+#   keyword lists  8/14
+#   thaillm-8b    11/14, median 1.8s — emitted <think> on 42/42 calls despite the prompt
+#   ptm-oss-120b  14/14, median 0.84s, p90 1.4s, no <think>, 0 inconsistent answers
+# including 0 (correct) for weather / coffee shop / off-corpus tax / fresh tax questions
+# asked mid-conversation. Classifying is safer than REWRITING: a rewrite experiment on the
+# same cases turned the weather question into the previous tax question.
+#
+# Called ONLY when it can change the outcome (see _should_classify_followup), so a normal tax
+# question pays nothing. Any failure or timeout returns None = today's behaviour.
+FOLLOWUP_CLASSIFIER_PROMPT = """ห้ามใช้ <think> ห้ามอธิบาย ตอบตัวเลขเดียว
+คำถามล่าสุดต้องอาศัยบทสนทนาก่อนหน้าจึงจะเข้าใจได้หรือไม่
+ตอบ 1 ถ้าคำถามล่าสุดอ้างถึงหรือต่อเนื่องจากหัวข้อก่อนหน้า (เช่น ละหัวข้อไว้ ใช้คำว่า ล่ะ อันนั้น ของพ่อแม่ สูงสุดกี่คน)
+ตอบ 0 ถ้าคำถามล่าสุดเข้าใจได้ด้วยตัวเอง หรือเป็นเรื่องใหม่ หรือไม่เกี่ยวกับภาษี
+
+บทสนทนาก่อนหน้า:
+{history}
+คำถามล่าสุด: {query}
+คำตอบ (1 หรือ 0):"""
+
+# How much prior conversation the classifier sees: the last two turns, answers clipped.
+# Enough to know the current topic; bounded so a long panel table can't slow the call.
+_FOLLOWUP_CLASSIFIER_TURNS = 2
+_FOLLOWUP_CLASSIFIER_ANSWER_CHARS = 300
+
+_followup_llm: ChatOpenAI | None = None
+
+
+def _get_followup_llm() -> ChatOpenAI:
+    global _followup_llm
+    if _followup_llm is None:
+        _followup_llm = ChatOpenAI(
+            base_url=os.environ["LLM_BASE_URL"],
+            api_key=os.environ["LLM_API_KEY"],
+            # GENERATE_MODEL (ptm-oss-120b), not ROUTER_MODEL: the "small" 8B model was both
+            # less accurate AND twice as slow here, because it always reasons first.
+            model=os.environ.get(
+                "FOLLOWUP_CLASSIFIER_MODEL",
+                os.environ.get("GENERATE_MODEL", os.environ["LLM_MODEL"]),
+            ),
+            temperature=0,
+            # Room for a reasoning preamble if a model emits one; the answer is one digit.
+            max_tokens=600,
+        )
+    return _followup_llm
+
+
+def _parse_followup_answer(raw: str) -> bool | None:
+    """First 0/1 after any reasoning block. None if there is no usable answer."""
+    if "<think>" in raw and "</think>" not in raw:
+        return None                      # still reasoning when the token budget ran out
+    body = raw.split("</think>")[-1]
+    for ch in body.strip():
+        if ch == "1":
+            return True
+        if ch == "0":
+            return False
+    return None
+
+
+def _should_classify_followup(query: str, messages: list, fast_route: str) -> bool:
+    """Only ask the LLM when its answer can change the outcome.
+
+    - the keyword router is about to answer "outside our scope" — a tax keyword hit already
+      routes to retrieval, so classifying those would only add latency;
+    - there is an earlier user question to follow up on;
+    - it is not a "which bank / company / fund is best" question, which RD never answers
+      however much it continues the conversation.
+    """
+    if os.getenv("FOLLOWUP_CLASSIFIER", "true").lower() != "true":
+        return False
+    if fast_route != "out_of_scope":
+        return False
+    if not _last_user_question(messages):
+        return False
+    return not _is_provider_recommendation(query)
+
+
+async def classify_followup(query: str, messages: list) -> bool | None:
+    """True/False from the LLM, or None on timeout / error / unparseable output."""
+    recent = [
+        m for m in messages
+        if (isinstance(m, dict) and m.get("role") in ("user", "assistant"))
+        or (isinstance(m, BaseMessage) and m.type in ("human", "ai"))
+    ][-_FOLLOWUP_CLASSIFIER_TURNS * 2:]
+    lines = []
+    for m in recent:
+        is_user = (m.get("role") == "user") if isinstance(m, dict) else (m.type == "human")
+        text = _message_content_text(m).strip()
+        if not is_user:
+            text = text[:_FOLLOWUP_CLASSIFIER_ANSWER_CHARS]
+        lines.append(f"{'ผู้ใช้' if is_user else 'อารี'}: {text}")
+    prompt = FOLLOWUP_CLASSIFIER_PROMPT.format(history="\n".join(lines), query=query.strip())
+
+    timeout_s = float(os.getenv("FOLLOWUP_CLASSIFIER_TIMEOUT_S", "2.5") or "2.5")
+    started = time.perf_counter()
+    try:
+        response = await asyncio.wait_for(
+            _get_followup_llm().ainvoke([HumanMessage(content=prompt)]), timeout_s
+        )
+    except asyncio.TimeoutError:
+        logger.warning("follow-up classifier timed out after %.1fs; using keyword routing", timeout_s)
+        return None
+    except Exception:
+        logger.exception("follow-up classifier failed; using keyword routing")
+        return None
+    verdict = _parse_followup_answer(str(response.content or ""))
+    logger.info(
+        "follow-up classifier: %s in %.0fms -> %s",
+        {True: "1", False: "0", None: "unparseable"}[verdict],
+        (time.perf_counter() - started) * 1000,
+        query,
+    )
+    return verdict
+
+
+class RouterOutput(BaseModel):
+    route: Literal["direct", "rag", "out_of_scope"]
+
+
+async def router_node(state: AgentState) -> dict:
+    llm = _get_router_llm().with_config({"tags": ["router_node"]}).with_structured_output(RouterOutput)
+    tracker.router_start = time.perf_counter()
+    result = await llm.ainvoke([
+        SystemMessage(content=ROUTER_SYSTEM_PROMPT),
+        HumanMessage(content=state["query"]),
+    ])
+    tracker.router_done = time.perf_counter()
+    logger.debug("router_node: %.0fms → %s", (tracker.router_done - tracker.router_start) * 1000, result.route)
+    return {"route": result.route}
+
+
+async def retrieve_node(state: AgentState) -> dict:
+    tracker.retrieve_start = time.perf_counter()
+    candidates = build_retrieval_candidates(
+        state["query"], state.get("messages", []), is_followup=bool(state.get("is_followup"))
+    )
+    # Rollback switch, and how the benchmark measures legacy vs cascade on an identical
+    # fixture. Falsy => original behaviour: one query, one attempt.
+    if os.getenv("RETRIEVAL_CASCADE", "true").lower() != "true":
+        candidates = candidates[:1]
+
+    text, sources = "", []
+    for attempt, (search_query, allow_rescue) in enumerate(candidates):
+        text, sources = await retrieve_with_sources(
+            search_query, allow_low_score_rescue=allow_rescue
+        )
+        if (text or "").strip():
+            if attempt:
+                # Only reached when the earlier candidates returned nothing, i.e. the
+                # turn was headed for the "call 1161" handoff.
+                logger.debug(
+                    "retrieve_node: candidate %d/%d rescued the turn -> %s",
+                    attempt + 1, len(candidates), search_query,
+                )
+            elif search_query != state["query"]:
+                logger.debug("retrieve_node: widened follow-up query -> %s", search_query)
+            break
+
+    tracker.retrieve_done = time.perf_counter()
+    logger.debug("retrieve_node: %.0fms", (tracker.retrieve_done - tracker.retrieve_start) * 1000)
+    return {"context": text, "sources": sources}
+
+
+NO_SOURCE_ANSWER = (
+    "ขออภัยค่ะ ตอนนี้ยังไม่มีข้อมูลเพียงพอที่จะตอบคำถามนี้ได้อย่างมั่นใจ\n"
+    "แนะนำให้ติดต่อเจ้าหน้าที่กรมสรรพากรโดยตรง โทร 1161 ค่ะ\n"
+    "\n"
+    "| ช่องทาง | รายละเอียด |\n"
+    "|---|---|\n"
+    "| ศูนย์บริการข้อมูลสรรพากร | โทร 1161 (จันทร์-ศุกร์ 08.30-18.00 น. ไม่พักกลางวัน) |\n"
+    "| นัดหมายล่วงหน้า | https://interapp2.rd.go.th/e-appointment/public/ |\n"
+    "| สำนักงานสรรพากรพื้นที่/สาขา | ค้นหาสำนักงานใกล้บ้าน https://www.rd.go.th/41225.html |\n"
+)
+
+
+def _no_source_response() -> dict:
+    """Retrieval found nothing usable: apologise and hand off to a human.
+
+    Returned as route "curated" so neither answer generator calls an LLM. With an
+    empty context the generator would answer from its own knowledge instead of the
+    knowledge base, which is exactly the hallucination this avoids.
+    """
+    return {
+        "route": "curated",
+        "context": "",
+        "sources": [],
+        "answer": NO_SOURCE_ANSWER,
+        "emotion": "sad",
+    }
+
+
+async def parallel_node(state: AgentState) -> dict:
+    rag_enabled = os.getenv("RAG_ENABLED", "true").lower() == "true"
+    manual_emotion = _manual_emotion_command(state["query"])
+    if manual_emotion:
+        router_start = time.perf_counter()
+        tracker.router_start = router_start
+        tracker.router_done = router_start
+        answer, emotion = manual_emotion
+        return {
+            "route": "curated",
+            "context": "",
+            "answer": answer,
+            "emotion": emotion,
+        }
+
+    curated = find_curated_answer(state["query"])
+    if curated:
+        router_start = time.perf_counter()
+        tracker.router_start = router_start
+        tracker.router_done = router_start
+        return {
+            "route": "curated",
+            "context": "",
+            "answer": curated[0],
+            "emotion": curated[1],
+        }
+
+    messages = state.get("messages", [])
+    fast_route = _fast_route(state["query"])
+    retrieval_state = state
+    if (
+        fast_route == "out_of_scope"
+        # A provider-recommendation question stays out of scope even with a "ล่ะ" on it;
+        # without this, "แล้วธนาคารไหนดอกเบี้ยสูงสุดล่ะ" after a tax turn was rescued to rag.
+        and not _is_provider_recommendation(state["query"])
+        and _is_tax_followup(state["query"], messages)
+    ):
+        # "rag", not "direct": a follow-up needs the knowledge base, and
+        # build_retrieval_query() widens it with the previous question first.
+        # Routing to "direct" here answered follow-ups with no context at all.
+        fast_route = "rag"
+    elif _should_classify_followup(state["query"], messages, fast_route):
+        if await classify_followup(state["query"], messages):
+            fast_route = "rag"
+            # Tell retrieval this depends on the previous turn, so it widens with the
+            # previous question even though no marker is present.
+            retrieval_state = {**state, "is_followup": True}
+    use_llm_router = os.getenv("ROUTER_USE_LLM", "false").lower() == "true"
+
+    if rag_enabled:
+        if fast_route == "rag":
+            router_start = time.perf_counter()
+            tracker.router_start = router_start
+            tracker.router_done = router_start
+            retrieve_result = await retrieve_node(retrieval_state)
+            if not (retrieve_result["context"] or "").strip():
+                return _no_source_response()
+            return {
+                "route": "rag",
+                "context": retrieve_result["context"],
+                "sources": retrieve_result.get("sources", []),
+            }
+        if fast_route == "direct":
+            router_start = time.perf_counter()
+            tracker.router_start = router_start
+            tracker.router_done = router_start
+            return {"route": "direct", "context": ""}
+        if fast_route == "out_of_scope" and not use_llm_router:
+            router_start = time.perf_counter()
+            tracker.router_start = router_start
+            tracker.router_done = router_start
+            return {"route": "out_of_scope", "context": ""}
+
+        router_task = asyncio.create_task(router_node(state))
+        retrieve_task = asyncio.create_task(retrieve_node(state))
+        router_result = await router_task
+
+        if router_result["route"] == "rag":
+            retrieve_result = await retrieve_task
+            context = retrieve_result["context"]
+            sources = retrieve_result.get("sources", [])
+        elif _mixed_code_terms(state["query"]):
+            retrieve_result = await retrieve_task
+            context = retrieve_result["context"]
+            sources = retrieve_result.get("sources", [])
+            if _context_contains_code(state["query"], context):
+                router_result = {"route": "rag"}
+            else:
+                context = ""
+                sources = []
+        else:
+            retrieve_task.cancel()
+            context = ""
+            sources = []
+    else:
+        router_result = await router_node(state)
+        context = ""
+        sources = []
+
+    if router_result["route"] == "rag" and not (context or "").strip():
+        return _no_source_response()
+
+    return {
+        "route": router_result["route"],
+        "context": context,
+        "sources": sources,
+    }
+
+
+async def curated_node(state: AgentState) -> dict:
+    answer = clean_display_text(state.get("answer", ""))
+    emotion = normalize_emotion(state["query"], answer, state.get("emotion", "idle"))
+    return {"answer": answer, "emotion": emotion}
+
+
+def _build_generation_messages(
+    state: AgentState,
+    *,
+    system_prompt: str,
+    include_context: bool,
+) -> list:
+    messages_for_llm = [SystemMessage(content=system_prompt)]
+    if state.get("context"):
+        messages_for_llm.append(
+            SystemMessage(
+                content=(
+                    "ข้อมูลอ้างอิงสำหรับตอบคำถามนี้:\n"
+                    f"{state['context']}\n\n"
+                    "ถ้าข้อมูลอ้างอิงมี [EXACT_MATCH] แปลว่าพบคำตอบที่ตรงกับคำถามมาก "
+                    "ต้องรักษาข้อมูลสำคัญจากแหล่งนั้นให้ครบ โดยเฉพาะตัวเลข อัตรา วันที่ "
+                    "เงื่อนไข ข้อยกเว้น ขั้นตอน และคำแนะนำให้ติดต่อหน่วยงานที่ระบุ "
+                    "ห้ามสรุปจนข้อมูลสำคัญหาย และห้ามเพิ่มข้อเท็จจริงนอกข้อมูลอ้างอิง\n"
+                    + (
+                        "ตอบจากข้อมูลอ้างอิงนี้เป็นหลัก ห้ามเดาความหมายอื่น "
+                        "ถ้าคำถามเป็นรหัสหรือคำสั้น ให้ตอบว่ารหัสนั้นอ้างถึงเนื้อหาใด "
+                        "โดยอธิบายจากข้อความจริง ห้ามพูดชื่อหมวดหรือหัวข้อภายในเช่น VAT_ หรือ PIT_"
+                        if include_context
+                        else "ใช้ข้อมูลอ้างอิงนี้ประกอบคำตอบบนหน้าจอ และอธิบายให้อ่านง่าย"
+                    )
+                )
+            )
+        )
+
+    for msg in state.get("messages", []):
+        if isinstance(msg, BaseMessage):
+            messages_for_llm.append(msg)
+        elif isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if not content:
+                continue
+            if role == "system":
+                messages_for_llm.append(SystemMessage(content=content))
+            elif role == "user":
+                messages_for_llm.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages_for_llm.append(AIMessage(content=content))
+
+    messages_for_llm.append(HumanMessage(content=state["query"]))
+    return messages_for_llm
+
+
+async def stream_voice_answer(state: AgentState):
+    messages_for_llm = _build_generation_messages(
+        state,
+        system_prompt=AREE_SYSTEM_PROMPT,
+        include_context=True,
+    )
+
+    async for chunk in _get_generate_llm().with_config({"tags": ["generate_node"]}).astream(messages_for_llm):
+        content = str(chunk.content)
+        if content:
+            yield content
+
+
+async def stream_text_answer(state: AgentState):
+    messages_for_llm = _build_generation_messages(
+        state,
+        system_prompt=TEXT_SYSTEM_PROMPT,
+        include_context=False,
+    )
+
+    async for chunk in _get_text_generate_llm().with_config({"tags": ["text_gen_node"]}).astream(messages_for_llm):
+        content = str(chunk.content)
+        if content:
+            yield content
+
+
+async def generate_node(state: AgentState) -> dict:
+
+    full_text = ""
+    async for content in stream_voice_answer(state):
+        full_text += content
+        await adispatch_custom_event("generate_token", content)
+    tracker.generate_done = time.perf_counter()
+
+    match = re.search(r'\[EMOTION:(\w+)\]', full_text)
+    raw_emotion = match.group(1) if match and match.group(1) in _VALID_EMOTIONS else "idle"
+    clean_text = re.sub(r'\[EMOTION:\w+\]', '', full_text).strip()
+    clean_text = clean_display_text(clean_text)
+    emotion = normalize_emotion(state["query"], clean_text, raw_emotion)
+
+    return {"answer": clean_text, "emotion": emotion}
+
+
+async def out_of_scope_node(state: AgentState) -> dict:
+    query = state.get("query", "")
+    if os.getenv("OUT_OF_SCOPE_USE_LLM", "false").lower() != "true":
+        # Reached when _fast_route() fell through, i.e. no keyword matched — which
+        # is NOT evidence the question is off topic. Asserting "this is outside our
+        # scope" would be wrong for a tax question worded outside the keyword lists,
+        # and offering the full staff handoff would be wrong for a genuinely
+        # off-topic one. So the wording is conditional, and the contact pointer is a
+        # single line rather than the NO_SOURCE_ANSWER table.
+        answer_text = clean_display_text(
+            "ขอโทษนะคะ หนูตอบได้เฉพาะเรื่องภาษีและบริการของกรมสรรพากร "
+            "และยังไม่มีข้อมูลสำหรับคำถามนี้ค่ะ\n"
+            "ถ้าเป็นเรื่องภาษี ถามหนูใหม่อีกครั้งได้ "
+            "หรือติดต่อเจ้าหน้าที่กรมสรรพากร โทร 1161 ค่ะ"
+        )
+        return {
+            "answer": answer_text,
+            "emotion": normalize_emotion(query, answer_text, "sad"),
+        }
+
+    prompt = f"""[CRITICAL] ห้ามใช้ <think> tag ทุกกรณี
+เริ่มตอบด้วย [EMOTION:x] ทันที ไม่ต้อง reasoning ก่อน
+DO NOT output <think> tags. Start immediately with [EMOTION:x].
+
+คุณคืออารี น้องสาวแสนน่ารักของกรมสรรพากร อายุ 25 ปี
+บุคลิกขี้เล่น อบอุ่น พูดภาษาไทยสบายๆ
+
+user พูดว่า: "{query}"
+
+เรื่องนี้ไม่ใช่เรื่องภาษีโดยตรง ตอบสั้นๆ 2-3 บรรทัด โดย:
+1. แสดงความเป็นห่วงหรือเข้าใจ user จริงๆ
+2. ตอบหรือ comment เบาๆ เกี่ยวกับสิ่งที่ user พูดได้ 1 ประโยค
+3. แนะนำว่าถ้ามีเรื่องภาษีให้ถามได้เลยนะคะ
+
+ตัวอย่าง:
+user: "ยังไม่ได้กินข้าวเลย"
+อารี: "[EMOTION:sad] โอ้โห ยังไม่ได้กินเลยเหรอคะ รีบไปกินก่อนเลยนะคะ\\n
+ท้องหิวแล้วคิดอะไรไม่ออกหรอก\\n
+พอกินเสร็จแล้วถ้ามีเรื่องภาษีให้ถามได้เลยนะคะ"
+
+ห้าม: <think> emoji markdown ตอบยาวเกิน 3 บรรทัด
+ห้ามพูดว่า "ดิฉัน" ให้ใช้ "หนู" หรือ "อารี" แทน
+ใช้ \\n แบ่งบรรทัด เริ่มด้วย [EMOTION:x] เสมอ"""
+
+    response = await _get_out_of_scope_llm().ainvoke([
+        {"role": "user", "content": prompt}
+    ])
+
+    answer = response.content
+
+    m = re.search(r'\[EMOTION:(\w+)\]', answer)
+    raw_emotion = m.group(1) if m and m.group(1) in _VALID_EMOTIONS else "idle"
+
+    clean = clean_llm_output(answer)
+    sentences = [s.strip() for s in clean.split('\n') if s.strip()]
+    answer_text = clean_display_text('\n'.join(sentences[:3]))
+    emotion = normalize_emotion(query, answer_text, raw_emotion)
+
+    return {"answer": answer_text, "emotion": emotion}

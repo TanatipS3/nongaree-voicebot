@@ -1,0 +1,501 @@
+"""Offline checks for graph/conversation.py. Run directly — there is no pytest here.
+
+    PYTHONIOENCODING=utf-8 python scripts/test_conversation.py
+
+Needs no Qdrant, no LiveKit and no network: everything under test is pure Python, which
+is the whole reason this logic lives in graph/ instead of agent.py. HANDOFF.md's standing
+rule is that a browser verdict means little without a corroborating agent log — these are
+the checks that do not depend on either.
+
+Covers two fixes:
+
+  make_turn_recorder   a follow-up asked while Aree was still speaking was routed with an
+                       empty history and fell through to "out_of_scope", because both
+                       answer paths appended to memory only after the LAST audio frame.
+                       On the typed path the turn was lost outright: a new question
+                       CANCELS _process_text_and_speak, so its tail append never ran.
+
+  extract_user_facts   compaction keeps KEEP_RECENT turns verbatim and the summariser
+                       (thaillm-8b, three sentences) dropped the numbers follow-ups need.
+                       Numbers the user stated are now pinned mechanically.
+"""
+import asyncio
+import os
+import pathlib
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from graph.conversation import (  # noqa: E402
+    KEEP_RECENT,
+    MAX_WINDOW,
+    append_turn,
+    build_messages_for_graph,
+    extract_user_facts,
+    make_turn_recorder,
+    maybe_summarize,
+    new_memory,
+    pin_facts,
+)
+from graph.curated_answers import find_curated_answer  # noqa: E402
+from graph.nodes import (  # noqa: E402
+    _MANUAL_EMOTION_ALIASES,
+    _is_tax_followup,
+    _manual_emotion_command,
+    _parse_followup_answer,
+    _should_classify_followup,
+    build_retrieval_candidates,
+)
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append((name, ok, detail))
+
+
+# --- make_turn_recorder ----------------------------------------------------------
+
+async def test_turn_recorder():
+    # The panel answer completing is what puts the turn in memory.
+    mem = new_memory()
+    persisted = []
+    record, on_detail = make_turn_recorder(
+        mem, "ลดหย่อนบุตรได้เท่าไหร่", on_recorded=persisted.append)
+    task = asyncio.create_task(asyncio.sleep(0, result="ลดหย่อนบุตรคนละ 30,000 บาท"))
+    task.add_done_callback(on_detail)
+    await asyncio.sleep(0.01)
+    check("records from the detail callback", len(mem["history"]) == 2, mem["history"])
+    check("on_recorded fired exactly once", len(persisted) == 1, persisted)
+
+    record(spoken="เสียงพูด", detail="ลดหย่อนบุตรคนละ 30,000 บาท")
+    check("tail call does not double-record", len(mem["history"]) == 2, len(mem["history"]))
+
+    # THE BUG, at the layer where it actually bit: _is_tax_followup needs a tax keyword
+    # in the recent context, so an empty history sent this question to out_of_scope.
+    followup = "ต้องใช้เอกสารอะไรบ้าง"
+    check("follow-up rescued once the turn is in memory",
+          _is_tax_followup(followup, mem["history"]) is True)
+    check("follow-up NOT rescued against empty memory (the old behaviour)",
+          _is_tax_followup(followup, new_memory()["history"]) is False)
+
+    # A cancelled or failed detail task must record nothing and raise nothing.
+    mem2 = new_memory()
+    record2, on_detail2 = make_turn_recorder(mem2, "q")
+    cancelled = asyncio.create_task(asyncio.sleep(5))
+    cancelled.add_done_callback(on_detail2)
+    cancelled.cancel()
+    await asyncio.sleep(0.01)
+    check("cancelled detail task records nothing", mem2["history"] == [], mem2["history"])
+
+    async def boom():
+        raise RuntimeError("detail stream died")
+
+    mem3 = new_memory()
+    _, on_detail3 = make_turn_recorder(mem3, "q")
+    failed = asyncio.create_task(boom())
+    failed.add_done_callback(on_detail3)
+    await asyncio.sleep(0.01)
+    check("failed detail task records nothing", mem3["history"] == [], mem3["history"])
+
+    # Speech but no panel answer still has to be recorded, by the tail.
+    check("spoken-only falls back to the tail", record2(spoken="พูดอย่างเดียว") is True)
+    check("spoken-only content stored",
+          mem2["history"][1]["content"] == "พูดอย่างเดียว", mem2["history"])
+
+    mem4 = new_memory()
+    record4, _ = make_turn_recorder(mem4, "q")
+    check("empty answer records nothing", record4() is False and mem4["history"] == [])
+
+    # Stored content must be identical to what the old tail-only path stored.
+    mem5 = new_memory()
+    record5, on_detail5 = make_turn_recorder(mem5, "q")
+    both = asyncio.create_task(asyncio.sleep(0, result="PANEL"))
+    both.add_done_callback(on_detail5)
+    await asyncio.sleep(0.01)
+    record5(spoken="SPOKEN", detail="PANEL")
+    check("detail wins, same as `detail or spoken`",
+          mem5["history"][1]["content"] == "PANEL", mem5["history"])
+
+
+# --- fact pinning ----------------------------------------------------------------
+
+class DroppingLLM:
+    """Summariser that strips every digit — the worst case of what thaillm-8b does."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, messages):
+        self.calls += 1
+        prompt = messages[0]["content"]
+        tail = re.sub(r"\d[\d,]*", "", prompt.split("สรุป:")[0])[-120:]
+
+        class R:
+            content = "ผู้ใช้ถามเรื่องภาษีเงินได้และการลดหย่อน " + tail[:40]
+
+        return R()
+
+
+class FailingLLM:
+    async def ainvoke(self, messages):
+        raise RuntimeError("summariser unavailable")
+
+
+def _long_conversation(n_turns):
+    mem = new_memory()
+    mem["history"] += [
+        {"role": "user", "content": "ถ้าเงินเดือน 100,000 บาทต้องจ่ายภาษีปีละเท่าไหร่"},
+        {"role": "assistant", "content": "ต้องเสียภาษีประมาณ 115,000 บาท"},
+        {"role": "user", "content": "แล้วถ้ามีลูก 3 คนล่ะ"},
+        {"role": "assistant", "content": "ลดหย่อนบุตรคนละ 30,000 บาท"},
+    ]
+    for i in range(n_turns - 2):
+        mem["history"] += [
+            {"role": "user", "content": f"คำถามที่ {i} เรื่องภาษี"},
+            {"role": "assistant", "content": f"คำตอบที่ {i}"},
+        ]
+    return mem
+
+
+async def test_fact_pinning():
+    facts = extract_user_facts([
+        {"role": "user", "content": "ถ้าเงินเดือน 100,000 บาทต้องจ่ายภาษีปีละเท่าไหร่"},
+        {"role": "assistant", "content": "ประมาณ 115,000 บาท"},
+        {"role": "user", "content": "แล้วถ้ามีลูก 3 คนล่ะ"},
+    ])
+    check("keeps the number with its leading noun",
+          any("100,000" in f and "เงินเดือน" in f for f in facts), facts)
+    check("keeps the child count", any("3" in f and "ลูก" in f for f in facts), facts)
+    check("ignores numbers Aree said", not any("115,000" in f for f in facts), facts)
+
+    # Incidental digits must not consume the cap or masquerade as facts.
+    noise = extract_user_facts([
+        {"role": "user", "content": "ภ.ง.ด.90 ยื่นเมื่อไหร่"},
+        {"role": "user", "content": "ตามมาตรา 40 ข้อ 2 ใช่ไหม"},
+    ])
+    check("form codes and section numbers dropped", noise == [], noise)
+
+    # THE DEFECT: compaction with a summariser that drops every number.
+    mem = _long_conversation(MAX_WINDOW + 3)
+    llm = DroppingLLM()
+    await maybe_summarize(mem, llm)
+    check("compaction actually ran", llm.calls == 1 and len(mem["history"]) == 4,
+          (llm.calls, len(mem["history"])))
+    check("the LLM prose really did drop the number",
+          "100,000" not in mem["summary"].split("\n", 1)[-1], mem["summary"])
+    check("salary survives compaction anyway", "100,000" in mem["summary"], mem["summary"])
+    check("child count survives compaction", "3 คน" in mem["summary"], mem["summary"])
+    check("pinned facts reach the graph",
+          any("100,000" in str(m.get("content", "")) for m in build_messages_for_graph(mem)))
+
+    for i in range(MAX_WINDOW + 2):
+        mem["history"] += [
+            {"role": "user", "content": f"คำถามรอบสอง {i}"},
+            {"role": "assistant", "content": f"ตอบ {i}"},
+        ]
+    await maybe_summarize(mem, llm)
+    check("facts survive a second compaction", "100,000" in mem["summary"], mem["summary"])
+    check("no duplicate pinned lines",
+          mem["summary"].count("ข้อมูลที่ผู้ใช้ระบุ:") == 1, mem["summary"])
+
+    same_number = extract_user_facts([
+        {"role": "user", "content": "เงินเดือน 50,000 บาท"},
+        {"role": "user", "content": "โบนัส 50,000 บาท"},
+    ])
+    check("same number+unit deduped, latest phrasing wins",
+          len([f for f in same_number if "50,000" in f]) == 1 and "โบนัส" in same_number[-1],
+          same_number)
+
+    # "ลูก 3 คน" and "ข้อ 3" are different facts; keying on the digits alone lost one.
+    distinct = extract_user_facts([
+        {"role": "user", "content": "มีลูก 3 คน"},
+        {"role": "user", "content": "ตามข้อ 3 ใช่ไหม"},
+    ])
+    check("same digit, different unit, kept separately",
+          any("คน" in f for f in distinct), distinct)
+
+    mem3 = _long_conversation(MAX_WINDOW + 3)
+    before = len(mem3["history"])
+    await maybe_summarize(mem3, FailingLLM())
+    check("failed summariser keeps history intact", len(mem3["history"]) == before)
+    check("failed summariser leaves the summary empty", mem3["summary"] == "")
+
+    many = [{"role": "user", "content": " ".join(f"ค่า {i}000 บาท" for i in range(1, 20))}]
+    check("pinned facts capped at 8", len(extract_user_facts(many)) == 8,
+          len(extract_user_facts(many)))
+    check("no facts leaves the summary untouched", pin_facts("สรุป", []) == "สรุป")
+
+
+def test_emotion_table_parity():
+    """The four emotion tables are duplicated in agent.py and graph/nodes.py.
+
+    CLAUDE.md has always said "change both", but nothing enforced it and they drifted
+    anyway: `_ANGRY_CONTEXT_TERMS` was 13 entries in agent.py and 15 in graph/nodes.py,
+    so a penalty answer could be scored `angry` on the graph path and downgraded to
+    `idle` on the spoken path. Parsed with ast rather than imported, because agent.py
+    cannot be imported without livekit.
+    """
+    import ast
+
+    def tables(path):
+        out = {}
+        for node in ast.parse(pathlib.Path(path).read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                name = node.targets[0].id
+                if name.endswith("_CONTEXT_TERMS"):
+                    try:
+                        out[name] = tuple(ast.literal_eval(node.value))
+                    except Exception:
+                        pass
+        return out
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    agent = tables(repo / "agent.py")
+    nodes = tables(repo / "graph" / "nodes.py")
+    for name in ("_ANGRY_CONTEXT_TERMS", "_SAD_CONTEXT_TERMS",
+                 "_HAPPY_CONTEXT_TERMS", "_WOW_CONTEXT_TERMS"):
+        check(f"{name} identical in agent.py and nodes.py",
+              agent.get(name) == nodes.get(name),
+              f"agent={agent.get(name)} nodes={nodes.get(name)}")
+
+    # The specific false positives that caused the drift to matter.
+    from graph.nodes import normalize_emotion
+    check("ปรับปรุง does not license angry",
+          normalize_emotion("ขอปรับปรุงข้อมูลผู้เสียภาษี", "ปรับปรุงได้ที่หน้าเว็บ", "angry") == "idle")
+    check("เงินเพิ่มเติม does not license angry",
+          normalize_emotion("ต้องจ่ายเงินเพิ่มเติมไหม", "ไม่ต้องจ่ายเงินเพิ่มเติม", "angry") == "idle")
+    check("a genuine severe case still licenses angry",
+          normalize_emotion("หนีภาษีมีโทษยังไง", "การหนีภาษีเป็นคดีอาญา มีโทษหนัก", "angry") == "angry")
+
+
+class SlowLLM:
+    """Summariser that takes real time, like ROUTER_MODEL does (2-10s in production)."""
+
+    async def ainvoke(self, messages):
+        await asyncio.sleep(0.3)
+
+        class R:
+            content = "สรุปบทสนทนา"
+
+        return R()
+
+
+async def test_compaction_race():
+    """Defect #7: a turn recorded WHILE summarisation is awaiting its LLM call.
+
+    maybe_summarize() runs as a fire-and-forget task. It used to decide which turns to keep
+    before the slow call and then overwrite history with that list, silently dropping any
+    turn appended during the wait — numbers included.
+    """
+    turns = MAX_WINDOW + 1                        # past the window, so compaction fires
+    mem = new_memory()
+    for i in range(turns):
+        append_turn(mem, f"คำถามที่ {i}", detail=f"คำตอบที่ {i}")
+    task = asyncio.create_task(maybe_summarize(mem, SlowLLM()))
+    await asyncio.sleep(0.05)                     # summariser is now mid-call
+    append_turn(mem, "ระหว่างสรุป เงินเดือน 70,000 บาท", detail="คำตอบระหว่างสรุป")
+    await task
+
+    users = [m["content"] for m in mem["history"] if m["role"] == "user"]
+    check("turn asked during summarisation is kept",
+          "ระหว่างสรุป เงินเดือน 70,000 บาท" in users, users)
+    check("summarised turns are removed, recent turns kept, no duplicates",
+          users == [f"คำถามที่ {i}" for i in range(turns - KEEP_RECENT, turns)]
+          + ["ระหว่างสรุป เงินเดือน 70,000 บาท"], users)
+    check("summary was applied", mem["summary"].endswith("สรุปบทสนทนา"), mem["summary"])
+
+    # History REPLACED while the summariser waited (a reload restoring a different memory):
+    # applying a cut computed on the old list would delete the wrong turns — discard instead.
+    mem2 = new_memory()
+    for i in range(turns):
+        append_turn(mem2, f"คำถามที่ {i}", detail=f"คำตอบที่ {i}")
+    task2 = asyncio.create_task(maybe_summarize(mem2, SlowLLM()))
+    await asyncio.sleep(0.05)
+    replacement = [{"role": "user", "content": "ประวัติใหม่"},
+                   {"role": "assistant", "content": "คำตอบใหม่"}]
+    mem2["history"] = replacement
+    await task2
+    check("replaced history is left untouched", mem2["history"] == replacement, mem2["history"])
+    check("stale summary is discarded", mem2["summary"] == "", mem2["summary"])
+
+
+def test_followup_classifier_offline():
+    """The LLM follow-up classifier's parsing and gating — everything that needs no LLM.
+
+    The gate is what keeps the classifier off the hot path: a normal tax question, a first
+    question, and a provider-recommendation question must never trigger an LLM call.
+    """
+    check("parse: '1' -> True", _parse_followup_answer("1") is True)
+    check("parse: '0' -> False", _parse_followup_answer("0") is False)
+    check("parse: answer after a reasoning block",
+          _parse_followup_answer("<think>ต่อเนื่องจากหัวข้อ</think>\n1") is True)
+    check("parse: unfinished reasoning -> None", _parse_followup_answer("<think>กำลังคิด") is None)
+    check("parse: Thai preamble then digit", _parse_followup_answer("คำตอบ: 0") is False)
+    check("parse: empty -> None", _parse_followup_answer("") is None)
+
+    history = [{"role": "user", "content": "ลดหย่อนบุตรได้เท่าไหร่"},
+               {"role": "assistant", "content": "คนละ 30,000 บาท"}]
+    previous = os.environ.pop("FOLLOWUP_CLASSIFIER", None)
+    try:
+        check("gate: out_of_scope + history -> classify",
+              _should_classify_followup("ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", history, "out_of_scope"))
+        check("gate: already routed to rag -> no LLM call",
+              not _should_classify_followup("ลดหย่อนบุตรได้เท่าไหร่", history, "rag"))
+        check("gate: first question of a conversation -> no LLM call",
+              not _should_classify_followup("ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", [], "out_of_scope"))
+        check("gate: provider recommendation -> no LLM call",
+              not _should_classify_followup("แล้วธนาคารไหนดอกเบี้ยสูงสุดล่ะ", history, "out_of_scope"))
+        os.environ["FOLLOWUP_CLASSIFIER"] = "false"
+        check("gate: FOLLOWUP_CLASSIFIER=false disables it",
+              not _should_classify_followup("ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", history, "out_of_scope"))
+    finally:
+        os.environ.pop("FOLLOWUP_CLASSIFIER", None)
+        if previous is not None:
+            os.environ["FOLLOWUP_CLASSIFIER"] = previous
+
+    # A classifier-confirmed follow-up widens with the previous question even without a marker.
+    plain = build_retrieval_candidates("ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", history)
+    confirmed = build_retrieval_candidates("ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", history, is_followup=True)
+    check("widening: unmarked question NOT widened without the classifier",
+          plain[0][0] == "ของพ่อแม่ใช้ได้ด้วยหรือเปล่า", plain[0])
+    check("widening: classifier-confirmed follow-up widened with the previous question",
+          confirmed[0][0] == "ของพ่อแม่ใช้ได้ด้วยหรือเปล่า ลดหย่อนบุตรได้เท่าไหร่", confirmed[0])
+
+
+def test_manual_emotion_command():
+    """The avatar-emotion shortcut must fire only on a message that IS a command.
+
+    Found by the 2026-09-14 supervisor scenario test: it matched a command word and an
+    emotion word ANYWHERE in the text, so "จ้างโปรแกรมเมอร์ฟรีแลนซ์ (บุคคลธรรมดา) ทำระบบ…"
+    ("ทำ" in ทำระบบ + "ธรรมดา" in บุคคลธรรมดา) was answered "กลับสู่อารมณ์ปกติแล้วนะคะ".
+    """
+    not_commands = [
+        "บริษัทจะจ้างโปรแกรมเมอร์ฟรีแลนซ์ (บุคคลธรรมดา) ทำระบบ 50,000 บาท ต้องหัก ณ ที่จ่ายกี่ % และใช้แบบ ภ.ง.ด. อะไร?",
+        "ถ้าเปลี่ยนคู่สัญญาจากฟรีแลนซ์บุคคลธรรมดา เป็นบริษัทรับทำซอฟต์แวร์ (นิติบุคคล) อัตราภาษีหัก ณ ที่จ่ายจะเปลี่ยนเป็นกี่ %?",
+        "ขอโทษค่ะ ทำงานฟรีแลนซ์ต้องเสียภาษีไหม",
+        "ยื่นล่วงหน้าได้ไหม ปกติต้องยื่นเมื่อไหร่",
+        "ทำไมยื่นภาษีแล้วยังไม่ได้เงินคืน ตกใจมาก",
+        "หน้าที่ของผู้จ่ายเงินได้บุคคลธรรมดาคืออะไร",
+        "ตามมาตรา 40 เงินได้บุคคลธรรมดามีกี่ประเภท",
+    ]
+    for q in not_commands:
+        check(f"emotion: NOT a command -> {q[:28]}", _manual_emotion_command(q) is None,
+              _manual_emotion_command(q))
+    commands = [
+        ("ทำหน้าเศร้า", "sad"), ("ทำตาง่วง", "sleep"), ("แสดงอารมณ์ดีใจ", "happy"),
+        ("แสดงอารมณ์ตื่นเต้นให้ดูหน่อย", "wow"), ("เปลี่ยนเป็นอารมณ์ปกติ", "idle"),
+        ("ทำหน้าปกติ", "idle"), ("หน้าโกรธ", "angry"), ("happy", "happy"),
+        ("show happy face", "happy"), ("make a sad face", "sad"),
+    ]
+    for q, emotion in commands:
+        got = _manual_emotion_command(q)
+        check(f"emotion: command still works -> {q}", got is not None and got[1] == emotion, got)
+
+    # The browser runs the same check BEFORE sending, so a mismatch means a typed question
+    # can be swallowed in VoiceRoom.tsx while the agent would have answered it.
+    tsx = (pathlib.Path(__file__).resolve().parent.parent / "components" / "VoiceRoom.tsx").read_text(encoding="utf-8")
+    ts_aliases = {
+        mode: set(re.findall(r"'([^']+)'", body))
+        for mode, body in re.findall(r"\['(\w+)',\s*\[([^\]]*)\]\]", tsx)
+    }
+    py_aliases = {mode: set(aliases) for mode, aliases in _MANUAL_EMOTION_ALIASES}
+    check("emotion: alias lists identical in agent and browser", ts_aliases == py_aliases,
+          f"ts={ts_aliases} py={py_aliases}")
+
+
+def test_curated_answer_scope():
+    """Canned answers must not hijack questions they only partly cover.
+
+    Found by the 2026-09-14 supervisor scenario test: "เงินเดือนรวม 600,000" (per year) was
+    read as MONTHLY (7,200,000 income, ~1,979,000 tax); "ThaiESG + ประกันชีวิต" got only the
+    insurance answer; "ฟรีแลนซ์ + หักค่าใช้จ่ายได้เท่าไร" got only the withholding answer.
+    """
+    hijacked = [
+        "ปีนี้มีเงินเดือนรวม 600,000 บาท ไม่มีรายได้อื่น มีค่าลดหย่อนพื้นฐานอะไรที่หักได้ทันทีบ้าง?",
+        "เพิ่งซื้อกองทุน ThaiESG ไป 50,000 บาท กับประกันชีวิตสะสมทรัพย์อีก 30,000 บาท มันนำมาลดหย่อนได้เต็มจำนวนเลยไหม?",
+        "ถ้ามีรับงานฟรีแลนซ์เพิ่มเข้ามาอีก 100,000 บาท โดนหัก ณ ที่จ่ายไว้ 3% ต้องเอามารวมคำนวณยังไง และหักค่าใช้จ่ายของฝั่งฟรีแลนซ์ได้เท่าไร?",
+        "เงินเดือนทั้งปี 480,000 บาท ต้องเสียภาษีเท่าไหร่",
+        "บริษัทจะจ้างโปรแกรมเมอร์ฟรีแลนซ์ (บุคคลธรรมดา) ทำระบบ 50,000 บาท ต้องหัก ณ ที่จ่ายกี่ % และใช้แบบ ภ.ง.ด. อะไร?",
+        "ถ้าเปลี่ยนคู่สัญญาจากฟรีแลนซ์บุคคลธรรมดา เป็นบริษัทรับทำซอฟต์แวร์ (นิติบุคคล) อัตราภาษีหัก ณ ที่จ่ายจะเปลี่ยนเป็นกี่ %?",
+    ]
+    for q in hijacked:
+        got = find_curated_answer(q)
+        check(f"curated: must NOT take -> {q[:30]}", got is None, (got or ("",))[0][:80])
+
+    # The simple questions canned answers exist for must keep working.
+    still_curated = [
+        ("ถ้าเงินเดือน 100,000 บาทต้องจ่ายภาษีปีละเท่าไหร่", "1,200,000"),
+        ("เงินเดือน 80,000 บาท ต้องเสียภาษีเท่าไหร่", "960,000"),
+        ("ประกันชีวิตลดหย่อนได้เท่าไหร่", "100,000"),
+        ("เบี้ยประกันสุขภาพพ่อแม่ลดหย่อนได้ไหม", ""),
+        ("ซื้อกองทุน RMF ลดหย่อนได้เท่าไหร่", "500,000"),
+        ("ดอกเบี้ยบ้านลดหย่อนได้เท่าไหร่", "ดอกเบี้ย"),
+        ("รับงานฟรีแลนซ์ 10,000 บาท โดนหัก ณ ที่จ่ายเท่าไหร่", "300"),
+    ]
+    for q, must_contain in still_curated:
+        got = find_curated_answer(q)
+        check(f"curated: still answers -> {q[:30]}",
+              got is not None and must_contain in got[0], (got or ("",))[0][:80])
+
+
+# --- phone numbers in spoken output ----------------------------------------------
+
+def test_phone_numbers_spoken_as_digits():
+    """1161 is the RD call centre and ships inside NO_SOURCE_ANSWER, so it is spoken on
+    every abstain turn. It used to be read as a quantity ("หนึ่งพันหนึ่งร้อยหกสิบเอ็ด").
+    Phone numbers must be read digit by digit, and amounts must NOT be."""
+    from graph.text_normalization import normalize_for_tts
+
+    digit_cases = [
+        ("โทร 1161", "หนึ่ง หนึ่ง หก หนึ่ง"),
+        ("เบอร์โทร 1444", "หนึ่ง สี่ สี่ สี่"),
+        ("สายด่วน 1161", "หนึ่ง หนึ่ง หก หนึ่ง"),
+        ("ติดต่อ 1161 ได้ทุกวัน", "หนึ่ง หนึ่ง หก หนึ่ง"),
+        ("1161", "หนึ่ง หนึ่ง หก หนึ่ง"),
+        ("โทร. 02-272-8000", "ศูนย์ สอง สอง เจ็ด สอง แปด ศูนย์ ศูนย์ ศูนย์"),
+        ("โทร 0812345678", "ศูนย์ แปด หนึ่ง สอง สาม สี่ ห้า หก เจ็ด แปด"),
+    ]
+    for text, expected in digit_cases:
+        got = normalize_for_tts(text)
+        check(f"phone spoken as digits: {text}", expected in got, got)
+
+    # The same digits as an AMOUNT must stay a quantity, or every baht figure breaks.
+    quantity_cases = [
+        ("ภาษี 1,444 บาท", "หนึ่งพันสี่ร้อยสี่สิบสี่บาท"),
+        ("ยอด 1161 บาท", "หนึ่งพันหนึ่งร้อยหกสิบเอ็ดบาท"),
+        ("ลดหย่อน 30,000 บาท", "สามหมื่นบาท"),
+        # A bare Buddhist year after a contact word is not a phone number.
+        ("ติดต่อ 2567", "สองพันห้าร้อยหกสิบเจ็ด"),
+    ]
+    for text, expected in quantity_cases:
+        got = normalize_for_tts(text)
+        check(f"amount stays a quantity: {text}", expected in got, got)
+
+    # The line that actually ships: the spoken half of the no-source handoff.
+    spoken = normalize_for_tts(
+        "แนะนำให้ติดต่อเจ้าหน้าที่กรมสรรพากรโดยตรง โทร 1161 ค่ะ")
+    check("NO_SOURCE_ANSWER hotline is spoken as digits",
+          "หนึ่ง หนึ่ง หก หนึ่ง" in spoken and "หนึ่งพันหนึ่งร้อย" not in spoken, spoken)
+
+
+async def main():
+    await test_turn_recorder()
+    await test_fact_pinning()
+    await test_compaction_race()
+    test_followup_classifier_offline()
+    test_manual_emotion_command()
+    test_curated_answer_scope()
+    test_emotion_table_parity()
+    test_phone_numbers_spoken_as_digits()
+
+
+asyncio.run(main())
+
+width = max(len(name) for name, _, _ in results)
+failed = sum(1 for _, ok, _ in results if not ok)
+for name, ok, detail in results:
+    print(f"{'PASS' if ok else 'FAIL'}  {name.ljust(width)}  {'' if ok else detail}")
+print(f"\n{len(results) - failed}/{len(results)} passed")
+sys.exit(1 if failed else 0)

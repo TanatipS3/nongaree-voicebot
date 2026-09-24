@@ -1,0 +1,42 @@
+# TEST OVERRIDE — point the LOCAL stack at the self-hosted LiveKit on the RD server
+# instead of LiveKit Cloud. Purely additive: delete this file to revert.
+#
+#   SELFHOST_LIVEKIT_KEY=... SELFHOST_LIVEKIT_SECRET=... \
+#   docker compose -p nongaree-local \
+#     -f docker-compose.local.yml -f docker-compose.selfhost.yml up -d web agent
+#
+# Requires the RD VPN: 10.223.5.31 is only routable there, and livekit.rd.go.th
+# exists only on RD internal DNS (NXDOMAIN publicly).
+#
+# Deliberately NOT touching docker-compose.yml — production stays on Cloud.
+
+services:
+  web:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      # The name resolves only on RD internal DNS, so map it explicitly.
+      - "livekit.rd.go.th:10.223.5.31"
+    environment:
+      # The browser is handed this URL by /api/livekit/token, and the route also
+      # derives its server-side API base from it (ws -> http).
+      LIVEKIT_URL: wss://livekit.rd.go.th
+      LIVEKIT_API_KEY: ${SELFHOST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${SELFHOST_LIVEKIT_SECRET}
+      # Caddy issues from its own CA. Trust it properly rather than disabling
+      # verification — this also proves the chain is correct.
+      NODE_EXTRA_CA_CERTS: /certs/caddy-local-root.crt
+    volumes:
+      - ./certs:/certs:ro
+
+  agent:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "livekit.rd.go.th:10.223.5.31"
+    environment:
+      # Plain ws straight to LiveKit, bypassing Caddy entirely. This is
+      # server-to-server on an internal network, so nothing is lost — and it
+      # sidesteps certificate trust in the Rust WebSocket layer, which does not
+      # honour SSL_CERT_FILE the way Python's HTTP clients do.
+      LIVEKIT_URL: ws://10.223.5.31:7880
+      LIVEKIT_API_KEY: ${SELFHOST_LIVEKIT_KEY}
+      LIVEKIT_API_SECRET: ${SELFHOST_LIVEKIT_SECRET}

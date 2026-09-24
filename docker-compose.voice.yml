@@ -1,0 +1,23 @@
+# TEST OVERRIDE — try a different TTS voice on the LOCAL stack.
+# Purely additive: delete this file to revert.
+#
+#   docker compose -p nongaree-local \
+#     -f docker-compose.local.yml -f docker-compose.voice.yml up -d --force-recreate agent
+#
+# Stack it AFTER docker-compose.selfhost.yml when testing against the RD LiveKit:
+#   -f docker-compose.local.yml -f docker-compose.selfhost.yml -f docker-compose.voice.yml
+#
+# Why a file rather than editing `docker container/.env`: that env file is on the
+# protected list (deployment), and the compose files do not interpolate ${TTS_VOICE},
+# so there is no way to override it from the shell alone.
+#
+# Voice names are validated by the TTS endpoint itself: a real voice returns 200 from
+# POST /audio/speech, an unknown one returns HTTP 500. `ped` (default) and `bantita`
+# are both confirmed working on model ptm-tts-1.
+#
+# To make a voice permanent, set TTS_VOICE in `docker container/.env` — ask first.
+
+services:
+  agent:
+    environment:
+      TTS_VOICE: ${LOCAL_TTS_VOICE:-bantita}

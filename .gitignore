@@ -1,0 +1,78 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+__pycache__/
+*.py[cod]
+*$py.class
+SCR-*.png
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+logs/
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+!docker container/.env.sso.example
+
+# credentials (plaintext UAT users — do not commit)
+users.csv
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# generated Docker image deployment artifacts
+docker container/images/*.tar
+nongaree-voicebot-image-deploy-*.tar.gz
+
+# local/generated benchmark and presentation scratch output
+reports/rag96_comparison_backup_*/
+reports/rag96_exact_match_report/
+reports/rag96_rerun_*/
+
+# local avatar/source-image scratch files
+/aree
+/aree.jpeg
+/Skin_Splash_Zombie_Brand.jpg
+/public/avatar/aree.jpeg
+
+# Python virtual environments
+.venv/
+venv/
+
+# Local tool configs
+.claude/
+.serena/
+
+# Local benchmark reports
+reports/
+local-login/

@@ -1,0 +1,6 @@
+# 1.6.5 pulls livekit-local-inference, whose wheel requires AVX; rd1 has no AVX.
+livekit-agents[openai,silero]==1.6.0
+python-dotenv>=1.0.0
+langgraph
+langchain-openai
+qdrant-client

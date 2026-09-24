@@ -1,0 +1,61 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  qdrant-restore:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+      SNAPSHOT_PATH: /snapshots/thai_tax_kb.snapshot.tar.gz
+    volumes:
+      - ./docker container/qdrant/snapshots:/snapshots:ro
+      - ./docker container/qdrant/scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/restore-qdrant-snapshot.sh"]
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile
+    image: nongaree-voicebot-web:latest
+    env_file:
+      - ./docker container/.env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    ports:
+      - "3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile.agent
+    image: nongaree-voicebot-agent:latest
+    env_file:
+      - ./docker container/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:

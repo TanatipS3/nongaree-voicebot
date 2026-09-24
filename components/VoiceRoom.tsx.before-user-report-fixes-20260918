@@ -1,0 +1,3766 @@
+'use client';
+
+import {
+  ConnectionState,
+  LocalAudioTrack,
+  LogLevel,
+  LoggerNames,
+  ParticipantKind,
+  RemoteParticipant,
+  RemoteTrack,
+  Room,
+  RoomEvent,
+  Track,
+  createLocalAudioTrack,
+  setLogLevel,
+} from 'livekit-client';
+import type { ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import LumoFace, { FaceMode, GazeState, LumoFaceHandle } from './LumoFace';
+
+interface Props {
+  roomName: string;
+}
+
+type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
+
+type AnswerDiagnostics = {
+  route?: string;
+  retrieval_empty?: boolean;
+  job_id?: string;
+  agent_name?: string;
+};
+
+type AnswerSource = {
+  n: number;
+  title: string;
+  domain: string;
+  subdomain: string;
+  cluster_id: string;
+  record_id: string;
+  excerpt: string;
+  url: string;
+  outdated: boolean;
+};
+type BrowserSpeechRecognitionResult = {
+  isFinal: boolean;
+  [index: number]: { transcript: string } | undefined;
+};
+type BrowserSpeechRecognitionResultEvent = {
+  resultIndex: number;
+  results: ArrayLike<BrowserSpeechRecognitionResult>;
+};
+type BrowserSpeechRecognitionErrorEvent = {
+  error?: string;
+  message?: string;
+};
+type BrowserSpeechRecognition = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: BrowserSpeechRecognitionResultEvent) => void) | null;
+  onerror: ((event: BrowserSpeechRecognitionErrorEvent) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+  abort: () => void;
+};
+type BrowserSpeechRecognitionConstructor = new () => BrowserSpeechRecognition;
+type SessionHistoryEntry = {
+  id: string;
+  question: string;
+  voiceAnswer: string;
+  detailAnswer: string;
+  time: string;
+};
+
+declare global {
+  interface Window {
+    SpeechRecognition?: BrowserSpeechRecognitionConstructor;
+    webkitSpeechRecognition?: BrowserSpeechRecognitionConstructor;
+  }
+}
+
+const VALID_MODES = new Set<FaceMode>(['idle', 'happy', 'sad', 'angry', 'wow', 'sleep']);
+const MANUAL_EMOTION_ALIASES: Array<[FaceMode, string[]]> = [
+  ['idle', ['idle', 'normal', 'neutral', 'ปกติ', 'ธรรมดา', 'นิ่ง']],
+  ['happy', ['happy', 'smile', 'joy', 'ดีใจ', 'ยิ้ม', 'มีความสุข', 'ร่าเริง']],
+  ['sad', ['sad', 'sorry', 'เศร้า', 'เสียใจ', 'ขอโทษ', 'หงอย']],
+  ['angry', ['angry', 'serious', 'โกรธ', 'จริงจัง', 'ดุ']],
+  ['wow', ['wow', 'surprise', 'surprised', 'ว้าว', 'ตกใจ', 'ตื่นเต้น']],
+  ['sleep', ['sleep', 'sleepy', 'หลับ', 'ง่วง', 'ง่วงนอน']],
+];
+const BROWSER_STT_FALLBACK = process.env.NEXT_PUBLIC_BROWSER_STT_FALLBACK !== 'false';
+const SHOW_SESSION_HISTORY = process.env.NEXT_PUBLIC_SHOW_SESSION_HISTORY !== 'false';
+const MAX_SESSION_HISTORY_ENTRIES = 80;
+const THAI_UI_FONT =
+  '"Noto Sans Thai", "IBM Plex Sans Thai", "Sukhumvit Set", Tahoma, Arial, system-ui, sans-serif';
+// Derived from failures that actually occurred, so the categories are already
+// validated by the supervisor's own feedback rather than invented.
+const REPORT_TYPES: { value: string; label: string }[] = [
+  { value: 'wrong_answer', label: 'คำตอบไม่ถูกต้อง' },
+  { value: 'incomplete', label: 'ตอบไม่ตรงคำถาม / ข้อมูลไม่ครบ' },
+  { value: 'outdated', label: 'ข้อมูลล้าสมัย' },
+  { value: 'no_response', label: 'ระบบค้าง / ไม่ตอบ' },
+  { value: 'audio_mic', label: 'เสียง หรือ ไมโครโฟนมีปัญหา' },
+  { value: 'other', label: 'อื่น ๆ' },
+];
+const REPORT_MAX_LEN = 2000;
+const REPORT_PRECEDING_TURNS = 3;
+
+const RESPONSE_THINKING_TIMEOUT_MS = 35_000;
+const FLUSH_DEBOUNCE_MS = 1200;
+// How long the room may have NO agent before asking the token route to dispatch one.
+// Longer than a cold start (measured ~9s from dispatch to join, "no warmed process
+// available"), so a normal first join or reload never triggers a redundant dispatch.
+const AGENT_ABSENT_GRACE_MS = 20_000;
+// After requesting a dispatch, how long to wait for it before trying again.
+const AGENT_REDISPATCH_RETRY_MS = 30_000;
+// Stop after this many consecutive requests with no agent arriving (e.g. the agent
+// worker is down); reset whenever an agent joins.
+const MAX_AGENT_REDISPATCHES = 3;
+
+// getUserMedia rejects with DOMException names, not readable text. Surfacing
+// error.message put English ("Permission denied", "Could not start audio source")
+// into a Thai-only UI.
+function describeMicError(error: unknown): string {
+  const name = error instanceof DOMException ? error.name : '';
+  switch (name) {
+    case 'NotAllowedError':
+    case 'SecurityError':
+      return 'เบราว์เซอร์ปฏิเสธการใช้ไมโครโฟน กรุณาอนุญาตจากไอคอนรูปกุญแจที่แถบที่อยู่เว็บ';
+    case 'NotFoundError':
+    case 'OverconstrainedError':
+      return 'ไม่พบไมโครโฟน กรุณาตรวจสอบการเชื่อมต่ออุปกรณ์';
+    case 'NotReadableError':
+    case 'AbortError':
+      return 'ไมโครโฟนถูกใช้งานโดยโปรแกรมอื่นอยู่ กรุณาปิดโปรแกรมนั้นแล้วลองใหม่';
+    default:
+      return 'เชื่อมต่อไมโครโฟนไม่สำเร็จ กรุณากดลองเชื่อมต่ออีกครั้ง';
+  }
+}
+
+// The avatar-emotion shortcut runs HERE, before a typed question is sent — a false match
+// swallows the question and the agent never sees it. It used to fire on a command word and
+// an emotion word anywhere in the text ("ทำ" in ทำระบบ + "ธรรมดา" in บุคคลธรรมดา), so real
+// tax questions became "กลับสู่อารมณ์ปกติ". It now matches only a message that IS a command,
+// anchored end to end. MUST stay equivalent to _manual_emotion_command() in graph/nodes.py.
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const EMOTION_ALIAS_ALT = MANUAL_EMOTION_ALIASES
+  .flatMap(([, aliases]) => aliases)
+  .sort((a, b) => b.length - a.length)
+  .map(escapeRegExp)
+  .join('|');
+const EMOTION_TARGET = '(?:สีหน้า|หน้า|ตา|อารมณ์|ท่าทาง)';
+const THAI_EMOTION_COMMAND = new RegExp(
+  `^(?:(?:ช่วย)?(?:ทำ|แสดง|เปลี่ยน|ขอ)(?:ให้)?(?:เป็น)?${EMOTION_TARGET}?(?:แบบ|เป็น|ให้)?` +
+    `|${EMOTION_TARGET}(?:แบบ)?)` +
+    `(${EMOTION_ALIAS_ALT})` +
+    '(?:ให้ดู)?(?:หน่อย|ที|นะ|สิ|ได้ไหม|ได้มั้ย)?(?:ค่ะ|คะ|ครับ|จ้า)?$',
+);
+const EN_EMOTION_COMMAND = new RegExp(
+  '^(?:please\\s+)?(?:show|make|set|use|do)\\s+(?:(?:a|an|the|me|your)\\s+)*' +
+    `(${EMOTION_ALIAS_ALT})` +
+    '(?:\\s+(?:face|emotion|mood|eyes?|expression))?(?:\\s+please)?[.!]?$',
+);
+const EN_EMOTION_NOUN = new RegExp(
+  `^(${EMOTION_ALIAS_ALT})\\s+(?:face|emotion|mood|eyes?|expression)$`,
+);
+
+function getManualEmotionCommand(text: string): FaceMode | null {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return null;
+  const compact = normalized.replace(/\s+/g, '');
+
+  let alias: string | null = null;
+  for (const candidate of [normalized, compact]) {
+    if (MANUAL_EMOTION_ALIASES.some(([, aliases]) => aliases.includes(candidate))) {
+      alias = candidate;
+      break;
+    }
+  }
+  if (alias === null) {
+    const match =
+      THAI_EMOTION_COMMAND.exec(compact) ||
+      EN_EMOTION_COMMAND.exec(normalized) ||
+      EN_EMOTION_NOUN.exec(normalized);
+    alias = match ? match[1] : null;
+  }
+  if (alias === null) return null;
+
+  for (const [mode, aliases] of MANUAL_EMOTION_ALIASES) {
+    if (aliases.includes(alias)) return mode;
+  }
+  return null;
+}
+
+function cleanPreviewText(text: string) {
+  return text.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to legacy fallback (e.g. non-secure context)
+    }
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    return document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
+    textarea.remove();
+  }
+}
+
+function cleanDetailDisplayText(text: string) {
+  return cleanPreviewText(text)
+    .replace(/\s*(ค่ะ|ครับ|นะคะ|นะครับ|คะ)(?=([\s\n.,!?)]|$))/g, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+function shouldUseDefinitionTable(text: string, question: string) {
+  const normalizedText = cleanDetailDisplayText(text);
+  const normalizedQuestion = cleanPreviewText(question).toLowerCase();
+  if (!normalizedText || /\|.+\|/.test(normalizedText)) return false;
+  if (normalizedText === 'กำลังคิดคำตอบ...' || normalizedText === 'กำลังคิดคำตอบละเอียด...') {
+    return false;
+  }
+  return (
+    /คืออะไร|หมายถึง|แปลว่า|ใช้ทำอะไร|คือใคร/.test(normalizedQuestion) ||
+    /(^|\s)(vat|e-filing|efiling)(\s|$)/i.test(normalizedQuestion) ||
+    /ภ\.?\s*ง\.?\s*ด\.?/i.test(normalizedQuestion) ||
+    /[0-9]+[a-z]+|[a-z]+[0-9]+/i.test(normalizedQuestion)
+  );
+}
+
+function shouldUseSalaryBreakdown(text: string, question: string) {
+  const normalizedText = cleanDetailDisplayText(text);
+  const normalizedQuestion = cleanPreviewText(question).toLowerCase();
+  if (!normalizedText || /\|.+\|/.test(normalizedText)) return false;
+  return (
+    (normalizedQuestion.includes('เงินเดือน') || normalizedQuestion.includes('เดือนละ')) &&
+    /ภาษี|เสีย|ยื่น|ต้องจ่าย/.test(normalizedQuestion) &&
+    /เงินได้สุทธิ|ภ\.ง\.ด\.91|120,?000|ลดหย่อน|ค่าใช้จ่าย/.test(normalizedText)
+  );
+}
+
+function shouldUseDeductionBreakdown(text: string, question: string) {
+  const normalizedText = cleanDetailDisplayText(text);
+  const normalizedQuestion = cleanPreviewText(question).toLowerCase();
+  if (!normalizedText || /\|.+\|/.test(normalizedText)) return false;
+  return (
+    /ลดหย่อน|ประกัน|กองทุน|ดอกเบี้ย|บริจาค/.test(normalizedQuestion) &&
+    /ลดหย่อน|สูงสุด|เงื่อนไข|หลักฐาน|เบี้ยประกัน|จ่ายจริง/.test(normalizedText)
+  );
+}
+
+function detailTags(text: string, question = '') {
+  const normalized = cleanDetailDisplayText(text).toLowerCase();
+  const tags: string[] = [];
+  if (normalized === 'กำลังคิดคำตอบ...' || normalized === 'กำลังคิดคำตอบละเอียด...') {
+    return ['LOADING'];
+  }
+  if (/\|.+\|/.test(normalized)) tags.push('TABLE');
+  if (shouldUseSalaryBreakdown(text, question)) tags.push('CALC');
+  if (shouldUseDeductionBreakdown(text, question)) tags.push('DEDUCTION');
+  if (!tags.includes('TABLE') && shouldUseDefinitionTable(text, question)) tags.push('INFO');
+  if (!tags.includes('CALC') && (normalized.includes('คำนวณ') || normalized.includes('เงินได้สุทธิ'))) {
+    tags.push('CALC');
+  }
+  if (normalized.includes('ภ.ง.ด') || normalized.includes('ยื่นแบบ')) tags.push('FILING');
+  if (!tags.includes('DEDUCTION') && (normalized.includes('ลดหย่อน') || normalized.includes('ประกัน'))) {
+    tags.push('DEDUCTION');
+  }
+  if (normalized.includes('เงื่อนไข') || normalized.includes('ควรตรวจ')) tags.push('CONDITION');
+  if (normalized && tags.length === 0) tags.push('ANSWER');
+  return tags.slice(0, 4);
+}
+
+function parseThaiMoneyAmount(value: string) {
+  const match = value.match(/([0-9][0-9,]*)\s*บาท/);
+  return match ? Number(match[1].replace(/,/g, '')) : null;
+}
+
+function parseMonthlySalaryFromQuestion(question: string) {
+  const cleanQuestion = cleanPreviewText(question);
+  const explicitMonthlyPatterns = [
+    /(?:เงินเดือน|รายได้ต่อเดือน|เดือนละ)\s*([0-9][0-9,]*)\s*บาท/,
+    /([0-9][0-9,]*)\s*บาท\s*(?:ต่อเดือน|\/เดือน|ทุกเดือน|เดือนละ)/,
+  ];
+
+  for (const pattern of explicitMonthlyPatterns) {
+    const match = cleanQuestion.match(pattern);
+    if (match?.[1]) return Number(match[1].replace(/,/g, ''));
+  }
+
+  if (/เงินเดือน|เดือนละ/.test(cleanQuestion)) {
+    return parseThaiMoneyAmount(cleanQuestion);
+  }
+
+  return null;
+}
+
+export default function VoiceRoom({ roomName }: Props) {
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState(false);
+  const [loggedOut, setLoggedOut] = useState(false);
+  const [status, setStatus] = useState<ConnectionStatus>('connecting');
+  const [micReady, setMicReady] = useState(false);
+  const [micError, setMicError] = useState('');
+  // Bumping this re-runs the room effect, which tears the old room down in its
+  // cleanup and rebuilds connection + mic from scratch. Cheaper and far less
+  // error-prone than a bespoke reconnect path.
+  const [connectAttempt, setConnectAttempt] = useState(0);
+  // Chunks the current answer was built from. Replaced every turn, including with
+  // an empty list on non-rag routes so stale markers never outlive their answer.
+  const [sources, setSources] = useState<AnswerSource[]>([]);
+  const [openSource, setOpenSource] = useState<number | null>(null);
+  const [diagnostics, setDiagnostics] = useState<AnswerDiagnostics>({});
+  // The DOMException NAME, kept separately from the Thai message shown to the user:
+  // names are stable and aggregatable, the copy is presentation and will change.
+  const [micErrorName, setMicErrorName] = useState('');
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportType, setReportType] = useState(REPORT_TYPES[0].value);
+  const [reportMessage, setReportMessage] = useState('');
+  const [reportState, setReportState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle');
+  const lastInputModeRef = useRef<'typed' | 'voice'>('typed');
+  const [isTalking, setIsTalking] = useState(false);
+  const [isAgentSpeaking, setIsAgentSpeaking] = useState(false);
+  const [textInput, setTextInput] = useState('');
+  const [currentUserText, setCurrentUserText] = useState('');
+  const [speechPreview, setSpeechPreview] = useState('');
+  const [detailPreview, setDetailPreview] = useState('');
+  const [sessionHistory, setSessionHistory] = useState<SessionHistoryEntry[]>([]);
+  const [sessionHistoryOpen, setSessionHistoryOpen] = useState(false);
+  const [copiedAnswer, setCopiedAnswer] = useState(false);
+  const [copiedHistoryId, setCopiedHistoryId] = useState<string | null>(null);
+  const [answerHovered, setAnswerHovered] = useState(false);
+  const [pendingQueue, setPendingQueue] = useState<string[]>([]);
+  const [turnActive, setTurnActive] = useState(false);
+  const faceRef = useRef<LumoFaceHandle>(null);
+  const roomRef = useRef<Room | null>(null);
+  const localAudioTrackRef = useRef<LocalAudioTrack | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const browserTranscriptRef = useRef('');
+  const talkingActiveRef = useRef(false);
+  const stopTalkingInFlightRef = useRef(false);
+  const interruptOnSpeechRef = useRef(false);
+  const interruptSentRef = useRef(false);
+  const gazeStateRef = useRef<GazeState>('idle');
+  const isAgentSpeakingRef = useRef(false);
+  const speechPreviewRef = useRef('');
+  const lastVoiceDeltaRef = useRef('');
+  const detailPreviewRef = useRef('');
+  // A new turn has started but none of its answer has arrived yet, so the panel is
+  // still showing the PREVIOUS turn's question and answer. Cleared by the first
+  // token of the new answer (or by the response timeout).
+  const supersedeOnNextDeltaRef = useRef(false);
+  const pendingUserTextRef = useRef('');
+  const [awaitingAnswer, setAwaitingAnswer] = useState(false);
+  const activeHistoryIdRef = useRef('');
+  const responseTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const agentRedispatchCountRef = useRef(0);
+  // Which halves of the current turn have reported. The 35s response timeout is the
+  // only thing that can un-stick a turn whose other half never arrives, so it must stay
+  // armed until BOTH the panel and the voice side have been heard from.
+  const panelSeenRef = useRef(false);
+  const voiceSeenRef = useRef(false);
+  // Seeded on mount rather than during render — Date.now() is impure and must not
+  // be called in the render body.
+  const lastActivityRef = useRef(0);
+  const pendingQueueRef = useRef<string[]>([]);
+  const turnActiveRef = useRef(false);
+  const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Login is SSO-only, so logout just clears the session and closes the tab.
+  // window.close() is a no-op for tabs the browser did not open via script
+  // (the RD SSO portal navigates here), so a "you may close this window" notice
+  // is shown as a fallback instead of redirecting anywhere.
+  const handleLogout = useCallback(async () => {
+    // Tear the media session down first: rendering the logged-out screen does not
+    // unmount this component, so the room-connection effect's cleanup never runs
+    // and the mic track would stay published after logout.
+    localAudioTrackRef.current?.stop();
+    localAudioTrackRef.current = null;
+    recognitionRef.current?.abort();
+    recognitionRef.current = null;
+    roomRef.current?.disconnect();
+    roomRef.current = null;
+
+    try {
+      // Clear stored conversation memory FIRST: /api/session/memory is session-gated,
+      // so it must run while the cookie is still valid. Signing out should not leave a
+      // transcript of the user's salary, dependants and ages on disk.
+      // Best-effort — the 30-minute TTL removes it anyway, and logout must not block.
+      await fetch('/api/session/memory', { method: 'DELETE' });
+    } catch {
+      // ignore — the TTL will expire it
+    }
+
+    try {
+      await fetch('/api/auth/sso/logout', { method: 'POST' });
+    } catch {
+      // ignore network errors — the session cookie is cleared server-side or expires
+    }
+    setLoggedOut(true);
+    window.close();
+  }, []);
+
+  useEffect(() => {
+    const IDLE_LIMIT_MS = 30 * 60 * 1000;
+    lastActivityRef.current = Date.now();
+
+    const idleCheck = setInterval(() => {
+      if (Date.now() - lastActivityRef.current > IDLE_LIMIT_MS) {
+        clearInterval(idleCheck);
+        void handleLogout();
+      }
+    }, 15_000);
+
+    return () => {
+      clearInterval(idleCheck);
+    };
+  }, [handleLogout]);
+
+  function setGaze(state: GazeState) {
+    if (gazeStateRef.current === state) return;
+    gazeStateRef.current = state;
+    faceRef.current?.setGazeState(state);
+  }
+
+  function clearResponseTimeout() {
+    if (!responseTimeoutRef.current) return;
+    clearTimeout(responseTimeoutRef.current);
+    responseTimeoutRef.current = null;
+  }
+
+  // Called as each half of an answer arrives. The timeout used to be cancelled by the
+  // first PANEL token alone, so a turn whose spoken side produced nothing (observed live:
+  // an empty spoken reply, so no voice_delta and no voice_answer) left the
+  // 'กำลังเตรียมคำตอบสั้น...' placeholder up with nothing left to clear it — caption
+  // stuck on กำลังคิด and every later question queued forever. Keeping the timeout armed
+  // until both halves report makes it the backstop for whichever half goes missing; its
+  // handler already leaves a delivered panel answer alone.
+  function noteAnswerProgress(side: 'panel' | 'voice') {
+    if (side === 'panel') panelSeenRef.current = true;
+    else voiceSeenRef.current = true;
+    if (panelSeenRef.current && voiceSeenRef.current) clearResponseTimeout();
+  }
+
+  const setSmartDetailPreview = useCallback((text: string) => {
+    setDetailPreview(text);
+  }, []);
+
+  const startSessionHistoryEntry = useCallback((question: string) => {
+    if (!SHOW_SESSION_HISTORY || !question.trim()) return;
+    const cleanQuestion = cleanPreviewText(question);
+    const now = new Date();
+    const entry: SessionHistoryEntry = {
+      id: `${now.getTime()}-${Math.random().toString(36).slice(2)}`,
+      question: cleanQuestion,
+      voiceAnswer: '',
+      detailAnswer: '',
+      time: now.toLocaleTimeString('th-TH', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
+    };
+    activeHistoryIdRef.current = entry.id;
+    setSessionHistory((previous) => {
+      const lastEntry = previous[previous.length - 1];
+      if (
+        lastEntry
+        && lastEntry.question === cleanQuestion
+        && !lastEntry.voiceAnswer
+        && !lastEntry.detailAnswer
+      ) {
+        activeHistoryIdRef.current = lastEntry.id;
+        return previous;
+      }
+      return [...previous, entry].slice(-MAX_SESSION_HISTORY_ENTRIES);
+    });
+  }, []);
+
+  const updateSessionHistoryEntry = useCallback((
+    field: 'voiceAnswer' | 'detailAnswer',
+    text: string,
+  ) => {
+    if (!SHOW_SESSION_HISTORY || !activeHistoryIdRef.current || !text.trim()) return;
+    const cleanText = cleanPreviewText(text);
+    setSessionHistory((previous) => previous.map((entry) => (
+      entry.id === activeHistoryIdRef.current
+        ? { ...entry, [field]: cleanText }
+        : entry
+    )));
+  }, []);
+
+  // Start a turn WITHOUT clearing the panel. The previous question and answer stay
+  // visible (with a LOADING badge) until the new answer produces its first token.
+  function beginPendingAnswer(question: string) {
+    supersedeOnNextDeltaRef.current = true;
+    pendingUserTextRef.current = question;
+    setAwaitingAnswer(true);
+    if (!detailPreviewRef.current) {
+      setSmartDetailPreview('กำลังคิดคำตอบละเอียด...');
+    }
+  }
+
+  // First content of the new answer arrived: swap question and answer together.
+  function commitPendingAnswer() {
+    if (!supersedeOnNextDeltaRef.current) return;
+    supersedeOnNextDeltaRef.current = false;
+    detailPreviewRef.current = '';
+    if (pendingUserTextRef.current) {
+      setCurrentUserText(pendingUserTextRef.current);
+      pendingUserTextRef.current = '';
+    }
+    setAwaitingAnswer(false);
+  }
+
+  function startResponseTimeout() {
+    clearResponseTimeout();
+    panelSeenRef.current = false;
+    voiceSeenRef.current = false;
+    responseTimeoutRef.current = setTimeout(() => {
+      responseTimeoutRef.current = null;
+      // Clear the short-answer placeholder from STATE, via an updater because this
+      // closure holds stale state. It used to test `speechPreviewRef.current` instead,
+      // but the placeholder never lives in the ref: sendTextMessage and the chat_user
+      // handler deliberately leave the ref '' (so voice_delta can append into it) while
+      // setting only the state. The ref check could never be true, the placeholder
+      // survived the timeout, `rawBusy` stayed true, the settle timer never started,
+      // `turnActive` never cleared — and every later question was queued client-side
+      // forever ("จะส่งเมื่ออารีพูดจบ" / เข้าคิว, caption stuck on กำลังคิด). Any turn
+      // that went unanswered for 35s froze the UI until reload: an agent still cold-
+      // starting when the first question is typed, a dropped packet, an agent restart.
+      setSpeechPreview((current) => (current === 'กำลังเตรียมคำตอบสั้น...' ? '' : current));
+      if (supersedeOnNextDeltaRef.current) {
+        // A turn started but nothing ever came back, so the panel is still showing
+        // the PREVIOUS answer. Leaving it there would misattribute it to the new
+        // question, so replace it; the old answer remains in the session history.
+        commitPendingAnswer();
+        detailPreviewRef.current = 'ยังไม่ได้รับคำตอบจากบอท กรุณาลองถามอีกครั้ง';
+        setSmartDetailPreview(detailPreviewRef.current);
+      } else if (
+        detailPreviewRef.current === '' ||
+        detailPreviewRef.current === 'กำลังคิดคำตอบ...' ||
+        detailPreviewRef.current === 'กำลังคิดคำตอบละเอียด...'
+      ) {
+        detailPreviewRef.current = 'ยังไม่ได้รับคำตอบจากบอท กรุณาลองถามอีกครั้ง';
+        setSmartDetailPreview(detailPreviewRef.current);
+      }
+      setGaze('idle');
+    }, RESPONSE_THINKING_TIMEOUT_MS);
+  }
+
+  function renderInlineMarkdown(text: string): ReactNode[] {
+    return text
+      .split(/(<br\s*\/?>|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/gi)
+      .filter(Boolean)
+      .map((part, index) => {
+      if (/^<br\s*\/?>$/i.test(part)) {
+        return <br key={index} />;
+      }
+      if (part.startsWith('`') && part.endsWith('`')) {
+        return (
+          <code
+            key={index}
+            style={{
+              borderRadius: 4,
+              background: 'rgba(255,255,255,0.12)',
+              color: '#fff',
+              fontFamily: 'monospace',
+              fontSize: '0.92em',
+              padding: '1px 5px',
+            }}
+          >
+            {part.slice(1, -1)}
+          </code>
+        );
+      }
+      if (part.startsWith('**') && part.endsWith('**')) {
+        return <strong key={index}>{part.slice(2, -2)}</strong>;
+      }
+      if (part.startsWith('*') && part.endsWith('*')) {
+        return <em key={index}>{part.slice(1, -1)}</em>;
+      }
+      return <span key={index}>{part}</span>;
+    });
+  }
+
+  function cleanTableCellPart(part: string) {
+    return cleanDetailDisplayText(
+      part
+        .replace(/^\s*(?:[•*]|[-–])\s*/g, '')
+        .replace(/^\s*(?:[•*]|[-–])\s*/g, '')
+        .replace(/\*\*/g, ''),
+    );
+  }
+
+  function renderTableCell(cell: string) {
+    const parts = cell
+      .split(/<br\s*\/?>/gi)
+      .map((part) => cleanTableCellPart(part))
+      .filter(Boolean);
+
+    if (parts.length <= 1) {
+      return renderInlineMarkdown(cleanTableCellPart(cell));
+    }
+
+    return (
+      <div style={{ display: 'grid', gap: 2 }}>
+        {parts.map((part, partIndex) => (
+          <div
+            key={partIndex}
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '8px minmax(0, 1fr)',
+              gap: 5,
+              alignItems: 'start',
+            }}
+          >
+            <span style={{ color: '#3ea3cb', lineHeight: 1.4 }}>•</span>
+            <span>{renderInlineMarkdown(part)}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  function renderMarkdownPreview(text: string, question = '') {
+    function normalizeMarkdownTableLines(rawText: string) {
+      const normalizedLines: string[] = [];
+      cleanDetailDisplayText(rawText).split('\n').forEach((rawLine) => {
+        const line = rawLine.trim();
+        const firstPipe = line.indexOf('|');
+        if (firstPipe > 0) {
+          const beforeTable = line.slice(0, firstPipe).trim();
+          const tablePart = line.slice(firstPipe).trim();
+          const tableCellCount = tablePart.split('|').filter((cell) => cell.trim()).length;
+          if (beforeTable && tableCellCount >= 2) {
+            normalizedLines.push(beforeTable);
+            normalizedLines.push(tablePart);
+            return;
+          }
+        }
+        normalizedLines.push(rawLine);
+      });
+      return normalizedLines;
+    }
+
+    const lines = normalizeMarkdownTableLines(text);
+    const blocks: ReactNode[] = [];
+    let index = 0;
+
+    function isTableSeparator(line: string) {
+      const cells = parseTableRow(line);
+      return cells.length >= 2 && cells.every((cell) => /^:?-{2,}:?$/.test(cell.trim()));
+    }
+
+    function isTableRow(line: string) {
+      return (
+        line.includes('|') &&
+        line.split('|').filter((cell) => cell.trim()).length >= 2 &&
+        !isTableSeparator(line)
+      );
+    }
+
+    function parseTableRow(line: string) {
+      return line
+        .trim()
+        .replace(/^\|/, '')
+        .replace(/\|$/, '')
+        .split('|')
+        .map((cell) => cell.trim());
+    }
+
+    function tableColumnWidth(columnCount: number, cellIndex: number) {
+      const presets: Record<number, string[]> = {
+        2: ['28%', '72%'],
+        3: ['18%', '32%', '50%'],
+        4: ['12%', '24%', '40%', '24%'],
+      };
+      return presets[columnCount]?.[cellIndex] || `${100 / columnCount}%`;
+    }
+
+    if (shouldUseSalaryBreakdown(text, question)) {
+      const cleanText = cleanDetailDisplayText(text);
+      const numbers = [...cleanText.matchAll(/([0-9][0-9,]*)\s*บาท/g)].map((match) =>
+        Number(match[1].replace(/,/g, '')),
+      );
+      const questionMonthly = parseMonthlySalaryFromQuestion(question);
+      const monthly = questionMonthly || numbers.find((value) => value > 0 && value <= 100_000) || null;
+      const annual = monthly ? monthly * 12 : numbers.find((value) => value >= 120_000) || null;
+      const netIncomeMatch = cleanText.match(/เงินได้สุทธิ(?:ประมาณ)?\s*([0-9][0-9,]*)\s*บาท/);
+      const netIncome = netIncomeMatch
+        ? Number(netIncomeMatch[1].replace(/,/g, ''))
+        : annual
+          ? Math.max(0, annual - Math.min(annual * 0.5, 100_000) - 60_000)
+          : null;
+      const ageMatch = cleanPreviewText(question).match(/อายุ\s*([0-9]{1,3})\s*ปี/);
+      const age = ageMatch ? Number(ageMatch[1]) : null;
+      const ageNote =
+        age === null
+          ? 'ยังไม่ได้ระบุอายุ'
+          : age >= 65
+            ? `อายุ ${age} ปี: อาจมีสิทธิยกเว้น/สิทธิประโยชน์ตามเกณฑ์ผู้สูงอายุ ควรตรวจรายละเอียดเพิ่ม`
+            : `อายุ ${age} ปี: ใช้เกณฑ์บุคคลธรรมดาทั่วไป ยังไม่เข้าเงื่อนไขสิทธิผู้สูงอายุ`;
+      const hasNoTax = /ไม่มีภาษีต้องชำระ|ยังไม่มีภาษี/.test(cleanText);
+      const summaryLine =
+        cleanText.split('\n').find((line) => /ไม่มีภาษี|ภาษีประมาณ|ต้องชำระ/.test(line)) ||
+        (hasNoTax ? 'คำนวณเบื้องต้นแล้วยังไม่มีภาษีต้องชำระ' : 'ตรวจสอบภาษีจากข้อมูลเงินเดือน');
+      const calcRows = [
+        monthly
+          ? {
+              item: 'เงินเดือน',
+              formula: 'รายได้ต่อเดือน',
+              result: `${monthly.toLocaleString()} บาท`,
+            }
+          : null,
+        annual
+          ? {
+              item: 'รายได้ทั้งปี',
+              formula: monthly ? `${monthly.toLocaleString()} x 12 เดือน` : 'ตามข้อมูลที่ระบุ',
+              result: `${annual.toLocaleString()} บาท`,
+            }
+          : null,
+        {
+          item: 'ค่าใช้จ่ายเหมา',
+          formula: '50% ของเงินได้ แต่ไม่เกิน 100,000 บาท',
+          result: '100,000 บาท',
+        },
+        {
+          item: 'ค่าลดหย่อนส่วนตัว',
+          formula: 'บุคคลธรรมดา',
+          result: '60,000 บาท',
+        },
+        {
+          item: 'อายุ',
+          formula: age === null ? 'ยังไม่มีข้อมูลอายุในคำถาม' : 'ตรวจสิทธิที่ขึ้นกับอายุ',
+          result: age === null ? 'ต้องถามเพิ่ม' : `${age} ปี`,
+        },
+        netIncome
+          ? {
+              item: 'เงินได้สุทธิ',
+              formula: 'รายได้ทั้งปี - ค่าใช้จ่าย - ลดหย่อน',
+              result: `${netIncome.toLocaleString()} บาท`,
+            }
+          : null,
+      ].filter(Boolean) as { item: string; formula: string; result: string }[];
+
+      return [
+        <div key="salary-breakdown" style={{ display: 'grid', gap: 14 }}>
+          <section
+            style={{
+              border: '1px solid rgba(62,163,203,0.2)',
+              borderLeft: '4px solid rgba(62,163,203,0.62)',
+              borderRadius: 8,
+              background: 'rgba(255,255,255,0.42)',
+              padding: '14px 16px',
+            }}
+          >
+            <div
+              style={{
+                color: '#25657c',
+                fontSize: 14,
+                fontWeight: 700,
+                letterSpacing: 0,
+                marginBottom: 8,
+              }}
+            >
+              ผลเบื้องต้น
+            </div>
+            <div style={{ color: '#102a36', fontSize: 18, fontWeight: 650, lineHeight: 1.58 }}>
+              {renderInlineMarkdown(summaryLine)}
+            </div>
+          </section>
+          <div style={{ overflowX: 'auto' }}>
+            <table
+              style={{
+                width: '100%',
+                borderCollapse: 'collapse',
+                fontSize: 14,
+                lineHeight: 1.48,
+                tableLayout: 'fixed',
+              }}
+            >
+              <colgroup>
+                <col style={{ width: '21%' }} />
+                <col style={{ width: '43%' }} />
+                <col style={{ width: '36%' }} />
+              </colgroup>
+              <thead>
+                <tr>
+                  {['รายการ', 'วิธีคิด', 'ผลลัพธ์'].map((header) => (
+                    <th
+                      key={header}
+                      style={{
+                        borderBottom: '1px solid rgba(62,163,203,0.28)',
+                        color: '#25657c',
+                        fontWeight: 700,
+                        fontSize: 14,
+                        padding: '8px 8px',
+                        textAlign: 'left',
+                      }}
+                    >
+                      {header}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {calcRows.map((row) => (
+                  <tr key={row.item}>
+                    <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 8px', fontWeight: 700, overflowWrap: 'break-word', verticalAlign: 'top' }}>
+                      {row.item}
+                    </td>
+                    <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 8px', overflowWrap: 'break-word', verticalAlign: 'top' }}>
+                      {row.formula}
+                    </td>
+                    <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 8px', fontWeight: 650, overflowWrap: 'break-word', verticalAlign: 'top' }}>
+                      {row.result}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
+              gap: 10,
+            }}
+          >
+            <div
+              style={{
+                border: '1px solid rgba(62,163,203,0.18)',
+                borderRadius: 7,
+                background: 'rgba(255,255,255,0.32)',
+                padding: '12px 14px',
+              }}
+            >
+              <div style={{ color: '#25657c', fontSize: 14, fontWeight: 700, letterSpacing: 0, marginBottom: 6 }}>
+                เกณฑ์ที่เกี่ยวข้อง
+              </div>
+              <div style={{ fontSize: 14, lineHeight: 1.62 }}>
+                รายได้ทั้งปีเกิน 120,000 บาท โดยทั่วไปควรยื่นแบบ ภ.ง.ด.91<br />
+                {ageNote}
+              </div>
+            </div>
+            <div
+              style={{
+                border: '1px solid rgba(62,163,203,0.18)',
+                borderRadius: 7,
+                background: 'rgba(255,255,255,0.32)',
+                padding: '12px 14px',
+              }}
+            >
+              <div style={{ color: '#25657c', fontSize: 14, fontWeight: 700, letterSpacing: 0, marginBottom: 6 }}>
+                ควรถามต่อ
+              </div>
+              <div style={{ fontSize: 14, lineHeight: 1.62 }}>
+                {age === null
+                  ? 'อายุ โบนัส รายได้อื่น กองทุน ประกัน คู่สมรสหรือบุตร เพื่อคำนวณให้แม่นขึ้น'
+                  : 'เดือนที่เริ่มทำงานจริง โบนัส รายได้อื่น กองทุน ประกัน คู่สมรสหรือบุตร เพื่อคำนวณให้แม่นขึ้น'}
+              </div>
+            </div>
+          </div>
+        </div>,
+      ];
+    }
+
+    if (shouldUseDeductionBreakdown(text, question)) {
+      const cleanText = cleanDetailDisplayText(text);
+      const linesForFacts = cleanText
+        .split('\n')
+        .map((line) => line.replace(/^\s*[•*-]\s*/, '').trim())
+        .filter(Boolean);
+      const limitMatches = [
+        ...cleanText.matchAll(/([^。\n]*?(?:ประกันชีวิต|ประกันสุขภาพ|กองทุน|ดอกเบี้ย|บริจาค)[^。\n]*?สูงสุด\s*[0-9][0-9,]*\s*บาท(?:ต่อปี)?)/g),
+      ].map((match) => match[1].trim());
+      const limitRows = (limitMatches.length ? limitMatches : linesForFacts.filter((line) => /สูงสุด|ไม่เกิน/.test(line)))
+        .slice(0, 4)
+        .map((line) => {
+          const amount = line.match(/([0-9][0-9,]*\s*บาท(?:ต่อปี)?)/)?.[1] || '-';
+          const item = line.includes('สุขภาพ')
+            ? 'ประกันสุขภาพ'
+            : line.includes('ชีวิต')
+              ? 'ประกันชีวิต'
+              : 'รายการลดหย่อน';
+          return { item, limit: amount, detail: line.replace(amount, '').trim() };
+        });
+      const conditionLines = linesForFacts
+        .filter((line) => /ต้อง|เมื่อ|หาก|ควร|หลักฐาน|จ่ายจริง|กำหนด|คุ้มครอง|รวม/.test(line))
+        .filter((line) => !limitRows.some((row) => row.detail === line || line.includes(row.limit)))
+        .slice(0, 5);
+
+      return [
+        <div key="deduction-breakdown" style={{ display: 'grid', gap: 14 }}>
+          <section
+            style={{
+              border: '1px solid rgba(62,163,203,0.2)',
+              borderLeft: '4px solid rgba(62,163,203,0.62)',
+              borderRadius: 8,
+              background: 'rgba(255,255,255,0.42)',
+              padding: '14px 16px',
+            }}
+          >
+            <div style={{ color: '#25657c', fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+              สรุปลดหย่อน
+            </div>
+            <div style={{ color: '#102a36', fontSize: 18, fontWeight: 650, lineHeight: 1.58 }}>
+              {renderInlineMarkdown(linesForFacts[0] || cleanText)}
+            </div>
+          </section>
+          {limitRows.length ? (
+            <div style={{ overflowX: 'auto' }}>
+              <table
+                style={{
+                  width: 'max(100%, 720px)',
+                  borderCollapse: 'collapse',
+                  fontSize: 14,
+                  lineHeight: 1.5,
+                  tableLayout: 'fixed',
+                }}
+              >
+                <colgroup>
+                  <col style={{ width: '24%' }} />
+                  <col style={{ width: '24%' }} />
+                  <col style={{ width: '52%' }} />
+                </colgroup>
+                <thead>
+                  <tr>
+                    {['รายการ', 'วงเงิน', 'รายละเอียด'].map((header) => (
+                      <th
+                        key={header}
+                        style={{
+                          borderBottom: '1px solid rgba(62,163,203,0.28)',
+                          color: '#25657c',
+                          fontWeight: 700,
+                          fontSize: 14,
+                          padding: '8px 10px',
+                          textAlign: 'left',
+                        }}
+                      >
+                        {header}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {limitRows.map((row, rowIndex) => (
+                    <tr key={`${row.item}-${rowIndex}`}>
+                      <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 10px', fontWeight: 700, verticalAlign: 'top' }}>
+                        {row.item}
+                      </td>
+                      <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 10px', verticalAlign: 'top' }}>
+                        {row.limit}
+                      </td>
+                      <td style={{ borderBottom: '1px solid rgba(62,163,203,0.16)', padding: '9px 10px', verticalAlign: 'top' }}>
+                        {row.detail || '-'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : null}
+          {conditionLines.length ? (
+            <div
+              style={{
+                border: '1px solid rgba(62,163,203,0.18)',
+                borderRadius: 7,
+                background: 'rgba(255,255,255,0.32)',
+                padding: '12px 14px',
+              }}
+            >
+              <div style={{ color: '#25657c', fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+                เงื่อนไขสำคัญ
+              </div>
+              <div style={{ display: 'grid', gap: 6 }}>
+                {conditionLines.map((line, lineIndex) => (
+                  <div
+                    key={lineIndex}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '9px minmax(0, 1fr)',
+                      gap: 8,
+                      fontSize: 14,
+                      lineHeight: 1.58,
+                    }}
+                  >
+                    <span style={{ color: '#3ea3cb' }}>•</span>
+                    <span>{renderInlineMarkdown(line)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
+          <div
+            style={{
+              border: '1px solid rgba(62,163,203,0.18)',
+              borderRadius: 7,
+              background: 'rgba(255,255,255,0.32)',
+              padding: '12px 14px',
+            }}
+          >
+            <div style={{ color: '#25657c', fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+              ควรถามต่อ
+            </div>
+            <div style={{ display: 'grid', gap: 6 }}>
+              {[
+                'จ่ายเบี้ยจริงปีนี้เท่าไร',
+                'เป็นประกันของตนเอง พ่อแม่ คู่สมรส หรือบุตร',
+                'เป็นประกันชีวิตทั่วไป ประกันสุขภาพ หรือแบบบำนาญ',
+                'มีหลักฐานการชำระเงินและหนังสือรับรองจากบริษัทประกันหรือไม่',
+              ].map((line) => (
+                <div
+                  key={line}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '9px minmax(0, 1fr)',
+                    gap: 8,
+                    fontSize: 14,
+                    lineHeight: 1.58,
+                  }}
+                >
+                  <span style={{ color: '#3ea3cb' }}>•</span>
+                  <span>{line}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>,
+      ];
+    }
+
+    if (shouldUseDefinitionTable(text, question)) {
+      const cleanText = cleanDetailDisplayText(text);
+      const sentenceParts = cleanText
+        .split(/(?<=[.!?])\s+|\n+/u)
+        .map((part) => part.trim())
+        .filter(Boolean);
+      let summary = sentenceParts[0] || cleanText;
+      let details = sentenceParts.slice(1).join(' ');
+      if (!details) {
+        const meaningSplit = summary.match(/^(.+?)\s+(หมายถึง.+)$/);
+        if (meaningSplit) {
+          summary = meaningSplit[1].trim();
+          details = meaningSplit[2].trim();
+        }
+      }
+
+      return [
+        <div
+          key="definition-summary"
+          style={{
+            display: 'grid',
+            gap: 10,
+            maxWidth: 920,
+          }}
+        >
+          <section
+            style={{
+              border: '1px solid rgba(62,163,203,0.2)',
+              borderLeft: '4px solid rgba(62,163,203,0.62)',
+              borderRadius: 8,
+              background: 'rgba(255,255,255,0.42)',
+              padding: '14px 16px',
+            }}
+          >
+            <div
+              style={{
+                color: '#25657c',
+                fontSize: 14,
+                fontWeight: 700,
+                letterSpacing: 0,
+                marginBottom: 8,
+              }}
+            >
+              ความหมาย
+            </div>
+            <div
+              style={{
+                color: '#102a36',
+                fontSize: 18,
+                fontWeight: 650,
+                lineHeight: 1.58,
+              }}
+            >
+              {renderInlineMarkdown(summary)}
+            </div>
+          </section>
+          {details ? (
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: '88px minmax(0, 1fr)',
+                gap: 12,
+                alignItems: 'start',
+                borderTop: '1px solid rgba(62,163,203,0.16)',
+                padding: '10px 4px 0',
+              }}
+            >
+              <div
+              style={{
+                color: 'rgba(37,101,124,0.72)',
+                fontSize: 14,
+                fontWeight: 700,
+                letterSpacing: 0,
+                paddingTop: 1,
+              }}
+              >
+                รายละเอียด
+              </div>
+              <div
+                style={{
+                  color: '#123b4a',
+                  fontSize: 15,
+                  lineHeight: 1.62,
+                }}
+              >
+                {renderInlineMarkdown(details)}
+              </div>
+            </div>
+          ) : null}
+        </div>,
+      ];
+    }
+
+    while (index < lines.length) {
+      const line = lines[index];
+
+      if (isTableRow(line) && lines[index + 1] && isTableSeparator(lines[index + 1])) {
+        const header = parseTableRow(line);
+        const rows: string[][] = [];
+        index += 2;
+        while (index < lines.length && isTableRow(lines[index])) {
+          rows.push(parseTableRow(lines[index]));
+          index += 1;
+        }
+        blocks.push(
+          <div key={`table-${index}`} style={{ overflowX: 'auto', marginTop: blocks.length ? 10 : 0 }}>
+            <table
+              style={{
+                width: 'max(100%, 760px)',
+                borderCollapse: 'collapse',
+                fontSize: 14,
+                lineHeight: 1.48,
+                tableLayout: 'fixed',
+              }}
+            >
+              <colgroup>
+                {header.map((_, cellIndex) => (
+                  <col
+                    key={cellIndex}
+                    style={{ width: tableColumnWidth(header.length, cellIndex) }}
+                  />
+                ))}
+              </colgroup>
+              <thead>
+                <tr>
+                  {header.map((cell, cellIndex) => (
+                    <th
+                      key={cellIndex}
+                      style={{
+                        borderBottom: '1px solid rgba(62,163,203,0.28)',
+                        color: '#25657c',
+                        fontWeight: 700,
+                        padding: '7px 10px',
+                        textAlign: 'left',
+                      }}
+                    >
+                      {renderInlineMarkdown(cleanDetailDisplayText(cell))}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    {header.map((_, cellIndex) => (
+                      <td
+                        key={cellIndex}
+                        style={{
+                          borderBottom: '1px solid rgba(62,163,203,0.16)',
+                          padding: '8px 10px',
+                          overflowWrap: 'break-word',
+                          wordBreak: 'normal',
+                          verticalAlign: 'top',
+                        }}
+                      >
+                        {renderTableCell(row[cellIndex] || '')}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>,
+        );
+        continue;
+      }
+
+      const bullet = line.match(/^\s*[-*]\s+(.+)$/);
+      if (bullet) {
+        blocks.push(
+          <div key={index} style={{ display: 'flex', gap: 7, marginTop: blocks.length ? 4 : 0 }}>
+            <span style={{ opacity: 0.65 }}>•</span>
+            <span>{renderInlineMarkdown(bullet[1])}</span>
+          </div>,
+        );
+        index += 1;
+        continue;
+      }
+
+      const numbered = line.match(/^\s*(\d+)[.)]\s+(.+)$/);
+      if (numbered) {
+        blocks.push(
+          <div key={index} style={{ display: 'flex', gap: 7, marginTop: blocks.length ? 4 : 0 }}>
+            <span style={{ opacity: 0.65 }}>{numbered[1]}.</span>
+            <span>{renderInlineMarkdown(numbered[2])}</span>
+          </div>,
+        );
+        index += 1;
+        continue;
+      }
+
+      const heading = line.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        const level = heading[1].length;
+        blocks.push(
+          <div
+            key={index}
+            style={{
+              color: '#fff',
+              fontWeight: 700,
+              fontSize: level === 1 ? 18 : level === 2 ? 17 : 16,
+              marginTop: blocks.length ? 10 : 0,
+              marginBottom: 2,
+            }}
+          >
+            {renderInlineMarkdown(heading[2])}
+          </div>,
+        );
+        index += 1;
+        continue;
+      }
+
+      const blockquote = line.match(/^\s*>\s+(.+)$/);
+      if (blockquote) {
+        blocks.push(
+          <div
+            key={index}
+            style={{
+              borderLeft: '2px solid rgba(255,255,255,0.28)',
+              color: 'rgba(255,255,255,0.78)',
+              marginTop: blocks.length ? 8 : 0,
+              paddingLeft: 9,
+            }}
+          >
+            {renderInlineMarkdown(blockquote[1])}
+          </div>,
+        );
+        index += 1;
+        continue;
+      }
+
+      if (/^\s*---+\s*$/.test(line)) {
+        blocks.push(
+          <div
+            key={index}
+            style={{
+              borderTop: '1px solid rgba(255,255,255,0.14)',
+              margin: blocks.length ? '10px 0 6px' : '4px 0 6px',
+            }}
+          />,
+        );
+        index += 1;
+        continue;
+      }
+
+      if (!line.trim()) {
+        blocks.push(<div key={index} style={{ height: 8 }} />);
+        index += 1;
+        continue;
+      }
+
+      blocks.push(
+        <div key={index} style={{ marginTop: blocks.length ? 4 : 0 }}>
+          {renderInlineMarkdown(line)}
+        </div>,
+      );
+      index += 1;
+    }
+
+    return blocks;
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    // Safari can surface LiveKit's internal lossy data-channel errors after a
+    // stale/reconnected session. The app uses reliable data packets for chat;
+    // keep the demo usable by hiding only the engine-level SDK error overlay.
+    setLogLevel(LogLevel.silent, LoggerNames.Engine);
+    const room = new Room({
+      audioCaptureDefaults: {
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
+    });
+    roomRef.current = room;
+    localAudioTrackRef.current = null;
+    let audioCtx: AudioContext | null = null;
+    let rafId = 0;
+    const attachedElements: HTMLMediaElement[] = [];
+    // The analyser watches ONE track, but more than one agent audio track can be
+    // subscribed at once — the token route removes duplicate agents after they have
+    // already joined (a stale dispatch, a reconnect, a StrictMode double fetch). Track
+    // which one is analysed so removing the OTHER agent does not kill it.
+    let analysedTrack: RemoteTrack | null = null;
+    const subscribedAudio: RemoteTrack[] = [];
+
+    // Keep an agent in the room. The token route dispatches only when it sees NO agent
+    // participant, but an agent whose user just closed the tab lingers for up to ~25s
+    // before its session closes. Reopen inside that window and the route reuses the
+    // dying agent, it leaves a moment later, and nothing ever dispatches another: every
+    // question then times out until a manual reload (HANDOFF.md §3e, OPEN reconnect race).
+    // The same dead end follows an agent crash or a worker restart mid-session.
+    //
+    // Recovery re-requests the token route WITHOUT reconnecting the room — the route's
+    // dispatch logic runs on every request, and the returned token is simply unused.
+    // Reconnecting instead would make the next agent see this participant leave and end
+    // its own job, recreating the race it is meant to fix.
+    let agentCheckTimer: ReturnType<typeof setTimeout> | null = null;
+    const isAgentParticipant = (participant: RemoteParticipant) =>
+      participant.kind === ParticipantKind.AGENT || participant.identity.startsWith('agent-');
+    const roomHasAgent = () =>
+      Array.from(room.remoteParticipants.values()).some(isAgentParticipant);
+    function clearAgentCheck() {
+      if (agentCheckTimer) clearTimeout(agentCheckTimer);
+      agentCheckTimer = null;
+    }
+    function scheduleAgentCheck(delayMs: number) {
+      clearAgentCheck();
+      agentCheckTimer = setTimeout(() => {
+        agentCheckTimer = null;
+        if (cancelled || roomRef.current !== room) return;
+        if (room.state !== ConnectionState.Connected || roomHasAgent()) return;
+        if (agentRedispatchCountRef.current >= MAX_AGENT_REDISPATCHES) {
+          console.warn('[VoiceRoom] no agent after repeated dispatch requests; giving up');
+          return;
+        }
+        agentRedispatchCountRef.current += 1;
+        console.warn(
+          `[VoiceRoom] no agent in room; requesting dispatch (${agentRedispatchCountRef.current}/${MAX_AGENT_REDISPATCHES})`,
+        );
+        void fetch(`/api/livekit/token?room=${encodeURIComponent(roomName)}`).catch(() => {});
+        scheduleAgentCheck(AGENT_REDISPATCH_RETRY_MS);
+      }, delayMs);
+    }
+
+    // The start screen used to double as the user gesture that unblocks audio
+    // playback. Without it, the browser autoplay policy can mute Aree's greeting
+    // until the first interaction — recover it on any pointer/keyboard input and
+    // surface a fallback prompt while playback is still blocked.
+    const unlockAudio = () => {
+      if (cancelled) return;
+      if (audioCtx?.state === 'suspended') void audioCtx.resume().catch(() => {});
+      if (!room.canPlaybackAudio) void room.startAudio().catch(() => {});
+    };
+    window.addEventListener('pointerdown', unlockAudio);
+    window.addEventListener('keydown', unlockAudio);
+
+    function stopAnalyser() {
+      cancelAnimationFrame(rafId);
+      audioCtx?.close();
+      audioCtx = null;
+      analysedTrack = null;
+      // A stopped analyser can never update isAgentSpeaking again, so leaving it as-is
+      // freezes it at whatever the last frame said. Frozen `true` keeps rawBusy true,
+      // the settle timer never starts, turnActive never clears, and every later
+      // question is queued forever ("กำลังตอบ" / เข้าคิว). Always reset on stop.
+      if (isAgentSpeakingRef.current) {
+        isAgentSpeakingRef.current = false;
+        setIsAgentSpeaking(false);
+      }
+    }
+
+    function startAnalyser(track: RemoteTrack) {
+      stopAnalyser();
+      analysedTrack = track;
+      // May start suspended when no user gesture has happened yet; unlockAudio()
+      // resumes it on the first interaction.
+      audioCtx = new AudioContext();
+      void audioCtx.resume().catch(() => {});
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+
+      const source = audioCtx.createMediaStreamSource(
+        new MediaStream([track.mediaStreamTrack]),
+      );
+      source.connect(analyser);
+
+      const buf = new Float32Array(analyser.fftSize);
+      function loop() {
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+        const rms = Math.sqrt(sum / buf.length);
+        faceRef.current?.setAmplitude(rms);
+        const speaking = rms > 0.01;
+        if (speaking !== isAgentSpeakingRef.current) {
+          isAgentSpeakingRef.current = speaking;
+          setIsAgentSpeaking(speaking);
+        }
+        if (speaking) {
+          setGaze('agent_talking');
+        } else if (gazeStateRef.current !== 'user_talking') {
+          setGaze('idle');
+        }
+        rafId = requestAnimationFrame(loop);
+      }
+      rafId = requestAnimationFrame(loop);
+    }
+
+    room
+      .on(RoomEvent.AudioPlaybackStatusChanged, () => {
+        if (cancelled) return;
+        setNeedsAudioUnlock(!room.canPlaybackAudio);
+      })
+      .on(RoomEvent.ConnectionStateChanged, (state: ConnectionState) => {
+        if (cancelled) return;
+        if (state === ConnectionState.Connected) setStatus('connected');
+        else if (state === ConnectionState.Disconnected) {
+          clearAgentCheck();
+          setStatus('disconnected');
+          supersedeOnNextDeltaRef.current = false;
+          pendingUserTextRef.current = '';
+          setAwaitingAnswer(false);
+          setPendingQueue([]);
+          pendingQueueRef.current = [];
+          turnActiveRef.current = false;
+          setTurnActive(false);
+          if (settleTimerRef.current) {
+            clearTimeout(settleTimerRef.current);
+            settleTimerRef.current = null;
+          }
+        }
+      })
+      .on(RoomEvent.ParticipantConnected, (participant: RemoteParticipant) => {
+        if (cancelled || !isAgentParticipant(participant)) return;
+        agentRedispatchCountRef.current = 0;
+        clearAgentCheck();
+      })
+      .on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+        if (cancelled || !isAgentParticipant(participant)) return;
+        // A duplicate removed while another agent stays is normal — only act when the
+        // room is left with none.
+        if (!roomHasAgent()) scheduleAgentCheck(AGENT_ABSENT_GRACE_MS);
+      })
+      .on(
+        RoomEvent.TrackSubscribed,
+        (track: RemoteTrack) => {
+          if (track.kind !== Track.Kind.Audio) return;
+          const el = track.attach();
+          document.body.appendChild(el);
+          attachedElements.push(el);
+          subscribedAudio.push(track);
+          startAnalyser(track);
+        },
+      )
+      .on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack) => {
+        if (track.kind !== Track.Kind.Audio) return;
+        track.detach().forEach((el) => el.remove());
+        const index = subscribedAudio.indexOf(track);
+        if (index >= 0) subscribedAudio.splice(index, 1);
+        // Only tear down the analyser if THIS was the track it was watching. It used to
+        // stop unconditionally, so when a duplicate agent was removed after a second one
+        // had joined, the analyser for the agent still in the room was cancelled and
+        // isAgentSpeaking froze mid-greeting — reproduced by dispatching a second agent
+        // and removing the first: the analyser's frame counter stopped dead and the UI
+        // stayed on "กำลังตอบ", queueing every later question.
+        if (track !== analysedTrack) return;
+        stopAnalyser();
+        faceRef.current?.setAmplitude(0);
+        // Hand the analyser to an agent track that is still here, if any.
+        const survivor = subscribedAudio[subscribedAudio.length - 1];
+        if (survivor) startAnalyser(survivor);
+      })
+      .on(RoomEvent.DataReceived, (payload: Uint8Array) => {
+        const text = new TextDecoder().decode(payload);
+        console.log('Received data packet:', text);
+
+        try {
+          const msg = JSON.parse(text) as {
+            type?: string;
+            text?: string;
+            emotion?: string;
+            requestId?: string;
+            sources?: AnswerSource[];
+            diagnostics?: AnswerDiagnostics;
+          };
+          if (msg.type === 'chat_user') {
+            // A typed turn has already run sendTextMessage(), which sets the
+            // supersede flag; a voice turn arrives here first.
+            lastInputModeRef.current = supersedeOnNextDeltaRef.current ? 'typed' : 'voice';
+            lastActivityRef.current = Date.now();
+            startSessionHistoryEntry(msg.text || '');
+            speechPreviewRef.current = '';
+            lastVoiceDeltaRef.current = '';
+            beginPendingAnswer(msg.text || '');
+            setSpeechPreview('กำลังเตรียมคำตอบสั้น...');
+            setGaze('agent_thinking');
+            startResponseTimeout();
+          }
+          if (msg.type === 'chat_sources') {
+            setSources(Array.isArray(msg.sources) ? msg.sources : []);
+            setDiagnostics(msg.diagnostics || {});
+            setOpenSource(null);
+          }
+          if (msg.type === 'chat_status') {
+            // While the previous answer is still on screen, the LOADING badge carries
+            // the status; overwriting here is what used to blank it.
+            if (!supersedeOnNextDeltaRef.current) {
+              detailPreviewRef.current = msg.text || 'กำลังคิดคำตอบละเอียด...';
+              setSmartDetailPreview(detailPreviewRef.current);
+            }
+          }
+          if (msg.type === 'voice_delta') {
+            const nextDelta = msg.text || '';
+            if (!nextDelta || nextDelta === lastVoiceDeltaRef.current) {
+              return;
+            }
+            lastVoiceDeltaRef.current = nextDelta;
+            if (speechPreviewRef.current === 'กำลังเตรียมคำตอบสั้น...') {
+              speechPreviewRef.current = '';
+            }
+            speechPreviewRef.current += nextDelta;
+            setSpeechPreview(speechPreviewRef.current.trim());
+            updateSessionHistoryEntry('voiceAnswer', speechPreviewRef.current.trim());
+            noteAnswerProgress('voice');
+          }
+          if (msg.type === 'voice_answer') {
+            // May arrive with EMPTY text: the agent now always closes the voice turn,
+            // even when the spoken reply produced nothing, precisely so this placeholder
+            // is cleared. `msg.text || ref` with an empty ref sets the state to ''.
+            lastVoiceDeltaRef.current = '';
+            speechPreviewRef.current = msg.text || speechPreviewRef.current;
+            setSpeechPreview(speechPreviewRef.current.trim());
+            updateSessionHistoryEntry('voiceAnswer', speechPreviewRef.current.trim());
+            noteAnswerProgress('voice');
+          }
+          if (msg.type === 'chat_delta') {
+            commitPendingAnswer();
+            if (
+              detailPreviewRef.current === 'กำลังคิดคำตอบ...' ||
+              detailPreviewRef.current === 'กำลังคิดคำตอบละเอียด...'
+            ) {
+              detailPreviewRef.current = '';
+            }
+            detailPreviewRef.current += msg.text || '';
+            setSmartDetailPreview(detailPreviewRef.current.trim());
+            updateSessionHistoryEntry('detailAnswer', detailPreviewRef.current.trim());
+            noteAnswerProgress('panel');
+          }
+          if (msg.type === 'chat_answer') {
+            if (msg.text) commitPendingAnswer();
+            detailPreviewRef.current = msg.text || detailPreviewRef.current;
+            setSmartDetailPreview(detailPreviewRef.current.trim());
+            updateSessionHistoryEntry('detailAnswer', detailPreviewRef.current.trim());
+            if (msg.text) noteAnswerProgress('panel');
+          }
+          if (msg.emotion && VALID_MODES.has(msg.emotion.toLowerCase() as FaceMode)) {
+            faceRef.current?.setMode(msg.emotion.toLowerCase() as FaceMode);
+          }
+          if (msg.type?.startsWith('chat_') || msg.emotion) return;
+        } catch {
+          // Legacy emotion packets are plain text, handled below.
+        }
+
+        const match = text.match(/\[EMOTION:(\w+)\]/i);
+        if (!match) return;
+        const emotion = match[1].toLowerCase() as FaceMode;
+        console.log('Matched emotion:', emotion);
+        if (!VALID_MODES.has(emotion)) return;
+        faceRef.current?.setMode(emotion);
+      });
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `/api/livekit/token?room=${encodeURIComponent(roomName)}`,
+        );
+        if (!res.ok) throw new Error('Token fetch failed');
+        const { token, url } = (await res.json()) as { token: string; url: string };
+        if (cancelled) return;
+        await room.connect(url, token);
+        if (cancelled) return;
+        // Covers the agent having already left before this page finished joining, when no
+        // ParticipantDisconnected will ever be seen here.
+        if (!roomHasAgent()) scheduleAgentCheck(AGENT_ABSENT_GRACE_MS);
+
+        const localTrack = await createLocalAudioTrack({
+          echoCancellation: true,
+          noiseSuppression: true,
+        });
+        localAudioTrackRef.current = localTrack;
+        await localTrack.mute();
+        await room.localParticipant.publishTrack(localTrack);
+        if (!cancelled) {
+          setMicReady(true);
+          setMicError('');
+        }
+      } catch (error) {
+        localAudioTrackRef.current = null;
+        if (!cancelled) {
+          setMicReady(false);
+          setMicError(describeMicError(error));
+          setMicErrorName(error instanceof DOMException ? error.name : 'Error');
+          setStatus(
+            room.state === ConnectionState.Connected ? 'connected' : 'disconnected',
+          );
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      clearAgentCheck();
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+      roomRef.current = null;
+      localAudioTrackRef.current?.stop();
+      localAudioTrackRef.current = null;
+      recognitionRef.current?.abort();
+      recognitionRef.current = null;
+      browserTranscriptRef.current = '';
+      talkingActiveRef.current = false;
+      stopTalkingInFlightRef.current = false;
+      clearResponseTimeout();
+      setMicReady(false);
+      stopAnalyser();
+      attachedElements.forEach((el) => el.remove());
+      room.disconnect();
+    };
+  }, [
+    roomName,
+    connectAttempt,
+    setSmartDetailPreview,
+    startSessionHistoryEntry,
+    updateSessionHistoryEntry,
+  ]);
+
+  // The turn being reported — the newest history entry. Null when nothing has been
+  // answered yet, which is exactly the "ระบบค้าง / ไม่ตอบ" case and the one most worth
+  // reporting, so the dialog must stay usable without it.
+  const reportedTurn = sessionHistory.length
+    ? sessionHistory[sessionHistory.length - 1]
+    : null;
+
+  const submitReport = useCallback(async () => {
+    const message = reportMessage.trim();
+    if (!message) return;
+    setReportState('sending');
+    lastActivityRef.current = Date.now();
+
+    // Bounded, NOT the whole session: history holds up to MAX_SESSION_HISTORY_ENTRIES
+    // (80), and shipping all of it would mean dozens of turns of someone's salary and
+    // children for one complaint. Three covers context-dependent bugs.
+    const preceding = sessionHistory
+      .slice(Math.max(0, sessionHistory.length - 1 - REPORT_PRECEDING_TURNS), sessionHistory.length - 1)
+      .map((entry) => ({
+        history_id: entry.id,
+        asked_at: entry.time,
+        question: entry.question,
+        detail_answer: entry.detailAnswer,
+      }));
+
+    try {
+      const res = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({
+          type: reportType,
+          message,
+          turn: reportedTurn
+            ? {
+                history_id: reportedTurn.id,
+                asked_at: reportedTurn.time,
+                question: reportedTurn.question,
+                voice_answer: reportedTurn.voiceAnswer,
+                detail_answer: reportedTurn.detailAnswer,
+                input_mode: lastInputModeRef.current,
+              }
+            : null,
+          sources,
+          diagnostics,
+          preceding_turns: preceding,
+          client: {
+            connection_status: status,
+            mic_ready: micReady,
+            mic_error: micErrorName,
+            turn_active: turnActive,
+            queued_questions: pendingQueue.length,
+            viewport: `${window.innerWidth}x${window.innerHeight}`,
+          },
+        }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      setReportState('sent');
+      setReportMessage('');
+    } catch {
+      setReportState('error');
+    }
+  }, [
+    reportMessage, reportType, reportedTurn, sessionHistory, sources, diagnostics,
+    status, micReady, micErrorName, turnActive, pendingQueue,
+  ]);
+
+  const openReport = useCallback(() => {
+    setReportState('idle');
+    setReportOpen(true);
+  }, []);
+
+  // Re-runs the room effect from scratch: full teardown in its cleanup, then a fresh
+  // token, room and microphone. Before this there was no recovery from a failed mic
+  // or a dropped connection short of the user reloading the page.
+  const handleRetryConnection = useCallback(() => {
+    lastActivityRef.current = Date.now();
+    setMicError('');
+    setMicErrorName('');
+    setStatus('connecting');
+    setConnectAttempt((value) => value + 1);
+  }, []);
+
+  const sendTextMessage = useCallback(async (text: string) => {
+    if (!roomRef.current || !text.trim()) return;
+    lastActivityRef.current = Date.now();
+    const cleanText = text.trim();
+    const manualEmotion = getManualEmotionCommand(cleanText);
+    if (manualEmotion) {
+      speechPreviewRef.current = '';
+      detailPreviewRef.current = '';
+      setCurrentUserText(cleanText);
+      setSpeechPreview('');
+      setSmartDetailPreview(manualEmotion === 'idle' ? 'กลับสู่อารมณ์ปกติ' : `แสดงอารมณ์: ${manualEmotion}`);
+      setGaze('idle');
+      clearResponseTimeout();
+      faceRef.current?.setMode(manualEmotion);
+      return;
+    }
+    speechPreviewRef.current = '';
+    lastInputModeRef.current = 'typed';
+    startSessionHistoryEntry(cleanText);
+    beginPendingAnswer(cleanText);
+    turnActiveRef.current = true;
+    setTurnActive(true);
+    setSpeechPreview('กำลังเตรียมคำตอบสั้น...');
+    setGaze('agent_thinking');
+    startResponseTimeout();
+    const encoder = new TextEncoder();
+    const payload = encoder.encode(JSON.stringify({ type: 'text_input', text: cleanText }));
+    await roomRef.current.localParticipant.publishData(payload, { reliable: true });
+  }, [startSessionHistoryEntry]);
+
+  const submitQuestion = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (turnActiveRef.current || pendingQueueRef.current.length > 0) {
+      pendingQueueRef.current = [...pendingQueueRef.current, trimmed];
+      setPendingQueue((q) => [...q, trimmed]);
+    } else {
+      void sendTextMessage(trimmed);
+    }
+  }, [sendTextMessage]);
+
+  const startBrowserSpeechRecognition = useCallback(() => {
+    if (!BROWSER_STT_FALLBACK || typeof window === 'undefined') return;
+    const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Recognition) {
+      setMicError('เบราว์เซอร์นี้ยังไม่รองรับการถอดเสียงจากไมโครโฟน กรุณาใช้ Chrome หรือเปิด STT server');
+      return;
+    }
+
+    recognitionRef.current?.abort();
+    browserTranscriptRef.current = '';
+    const recognition = new Recognition();
+    recognition.lang = 'th-TH';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (event) => {
+      let transcript = '';
+      for (let index = event.resultIndex; index < event.results.length; index += 1) {
+        transcript += event.results[index]?.[0]?.transcript || '';
+      }
+      const cleanTranscript = transcript.trim();
+      if (cleanTranscript) {
+        browserTranscriptRef.current = cleanTranscript;
+        if (interruptOnSpeechRef.current && !interruptSentRef.current) {
+          interruptSentRef.current = true;
+          const payload = new TextEncoder().encode(JSON.stringify({ type: 'interrupt' }));
+          roomRef.current?.localParticipant.publishData(payload, { reliable: true }).catch(() => {
+            interruptSentRef.current = false;
+          });
+          isAgentSpeakingRef.current = false;
+          setIsAgentSpeaking(false);
+        }
+      }
+    };
+    recognition.onerror = (event) => {
+      if (event.error === 'no-speech') return;
+      setMicError(event.message || `ไมโครโฟนถอดเสียงไม่ได้ (${event.error || 'unknown'})`);
+    };
+    recognition.onend = () => {
+      if (recognitionRef.current === recognition) recognitionRef.current = null;
+    };
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch (error) {
+      recognitionRef.current = null;
+      setMicError(
+        error instanceof Error
+          ? error.message
+          : 'ไม่สามารถเริ่มถอดเสียงจากไมโครโฟนได้',
+      );
+    }
+  }, []);
+
+  const stopBrowserSpeechRecognition = useCallback(() => {
+    const transcript = browserTranscriptRef.current.trim();
+    browserTranscriptRef.current = '';
+    if (!recognitionRef.current) return transcript;
+    try {
+      recognitionRef.current.stop();
+    } catch {
+      recognitionRef.current.abort();
+    } finally {
+      recognitionRef.current = null;
+    }
+    return transcript;
+  }, []);
+
+  const sendInterruptSignal = useCallback(async () => {
+    const room = roomRef.current;
+    if (!room) return;
+    const payload = new TextEncoder().encode(JSON.stringify({ type: 'interrupt' }));
+    await room.localParticipant.publishData(payload, { reliable: true });
+  }, []);
+
+  const startTalking = useCallback(async () => {
+    if (talkingActiveRef.current || stopTalkingInFlightRef.current) return;
+    console.log('🎤 mic ON');
+    const localTrack = localAudioTrackRef.current;
+    const micPub = roomRef.current?.localParticipant.getTrackPublication(Track.Source.Microphone);
+    if (!localTrack && !micPub) {
+      setMicError('ไมโครโฟนยังไม่พร้อม กรุณาลองอนุญาตการใช้ไมโครโฟนอีกครั้ง');
+      return;
+    }
+    try {
+      talkingActiveRef.current = true;
+      interruptOnSpeechRef.current = isAgentSpeakingRef.current;
+      interruptSentRef.current = false;
+      if (localTrack) await localTrack.unmute();
+      else await micPub?.unmute();
+      setMicError('');
+      startBrowserSpeechRecognition();
+      setGaze('user_talking');
+      setIsTalking(true);
+    } catch (error) {
+      talkingActiveRef.current = false;
+      setMicError(
+        error instanceof Error
+          ? error.message
+          : 'ไม่สามารถเปิดไมโครโฟนได้',
+      );
+    }
+  }, [startBrowserSpeechRecognition]);
+
+  const stopTalking = useCallback(async () => {
+    if (!talkingActiveRef.current || stopTalkingInFlightRef.current) return;
+    talkingActiveRef.current = false;
+    stopTalkingInFlightRef.current = true;
+    console.log('🎤 mic OFF');
+    const transcript = stopBrowserSpeechRecognition();
+    const localTrack = localAudioTrackRef.current;
+    const micPub = roomRef.current?.localParticipant.getTrackPublication(Track.Source.Microphone);
+    try {
+      if (localTrack) await localTrack.mute();
+      else await micPub?.mute();
+      if (transcript) {
+        if (interruptOnSpeechRef.current && !interruptSentRef.current) {
+          await sendInterruptSignal();
+          isAgentSpeakingRef.current = false;
+          setIsAgentSpeaking(false);
+        }
+        await sendTextMessage(transcript);
+      }
+    } finally {
+      interruptOnSpeechRef.current = false;
+      interruptSentRef.current = false;
+      stopTalkingInFlightRef.current = false;
+      if (!transcript) setGaze('idle');
+      setIsTalking(false);
+    }
+  }, [sendInterruptSignal, sendTextMessage, stopBrowserSpeechRecognition]);
+
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.code !== 'Space' || e.repeat) return;
+      if (e.target instanceof HTMLInputElement) return;
+      e.preventDefault();
+      startTalking();
+    }
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.code !== 'Space') return;
+      if (e.target instanceof HTMLInputElement) return;
+      e.preventDefault();
+      stopTalking();
+    }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup', onKeyUp);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup', onKeyUp);
+    };
+  }, [startTalking, stopTalking]);
+
+  // Keep pendingQueueRef in sync with state so submitQuestion can read it without stale closures
+  useEffect(() => {
+    pendingQueueRef.current = pendingQueue;
+  }, [pendingQueue]);
+
+  // Effect A: settle timer — keeps turnActive sticky-true until FLUSH_DEBOUNCE_MS after last audio
+  useEffect(() => {
+    const rawBusy =
+      isAgentSpeaking ||
+      awaitingAnswer ||
+      speechPreview === 'กำลังเตรียมคำตอบสั้น...' ||
+      detailPreview === 'กำลังคิดคำตอบ...' ||
+      detailPreview === 'กำลังคิดคำตอบละเอียด...';
+
+    if (rawBusy) {
+      // Agent is active — cancel any pending settle
+      if (settleTimerRef.current) {
+        clearTimeout(settleTimerRef.current);
+        settleTimerRef.current = null;
+      }
+      return;
+    }
+
+    // Agent is silent; if turn was active, start settle timer (only if not already running)
+    if (turnActive && !settleTimerRef.current) {
+      settleTimerRef.current = setTimeout(() => {
+        settleTimerRef.current = null;
+        turnActiveRef.current = false;
+        setTurnActive(false);
+      }, FLUSH_DEBOUNCE_MS);
+    }
+  }, [isAgentSpeaking, awaitingAnswer, speechPreview, detailPreview, turnActive]);
+
+  // Effect B: flush — fires immediately when turn settles and queue is non-empty.
+  // The dequeue is a deliberate setState-in-effect: the queue is drained in
+  // response to external LiveKit turn state (the agent finishing its answer),
+  // and sendTextMessage sets turnActive back to true, so exactly one question is
+  // released per settle cycle rather than cascading.
+  useEffect(() => {
+    if (turnActive || status !== 'connected' || pendingQueue.length === 0) return;
+    const [next, ...rest] = pendingQueue;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setPendingQueue(rest);
+    pendingQueueRef.current = rest;
+    void sendTextMessage(next);
+  }, [turnActive, pendingQueue, status, sendTextMessage]);
+
+  const isPreparingDetail =
+    awaitingAnswer ||
+    detailPreview === 'กำลังคิดคำตอบ...' || detailPreview === 'กำลังคิดคำตอบละเอียด...';
+
+  const isPreparingShort = speechPreview === 'กำลังเตรียมคำตอบสั้น...';
+  const isThinking = !isTalking && !isAgentSpeaking && (isPreparingShort || isPreparingDetail);
+  const tags = awaitingAnswer ? ['LOADING'] : detailTags(detailPreview, currentUserText);
+  const interactionLabel = isTalking
+    ? 'กำลังฟัง'
+    : isAgentSpeaking
+      ? 'กำลังตอบ'
+      : isThinking
+        ? 'กำลังคิด'
+        : 'กดค้างไว้เพื่อพูด';
+  const showTalkHint = !isTalking && !isAgentSpeaking && !isThinking;
+  const statusLabel =
+    status === 'connected'
+      ? 'เชื่อมต่อแล้ว'
+      : status === 'connecting'
+        ? 'กำลังเชื่อมต่อ'
+        : 'ยังไม่เชื่อมต่อ';
+  const micControlReady = status === 'connected' && micReady;
+  const canTalk = micControlReady;
+  const textControlReady = status === 'connected';
+  const willQueue = turnActive || pendingQueue.length > 0;
+  // 'disconnected' was never surfaced in the UI: every control disables and the page
+  // just looks frozen. That silence is what read as "ระบบค้าง".
+  const showRetry = status === 'disconnected' || Boolean(micError);
+  const micStatusLabel =
+    status === 'connected' && !micReady && !micError
+      ? 'กำลังเตรียมไมโครโฟน'
+      : micError
+        ? 'ไมโครโฟนยังไม่พร้อม'
+        : statusLabel;
+
+  if (loggedOut) {
+    return (
+      <div
+        style={{
+          minHeight: '100svh',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#f8fafc',
+          padding: 24,
+        }}
+      >
+        <div
+          style={{
+            textAlign: 'center',
+            fontFamily: THAI_UI_FONT,
+            color: '#102a36',
+            maxWidth: 420,
+          }}
+        >
+          <p style={{ fontSize: 18, fontWeight: 700, margin: '0 0 8px' }}>
+            ออกจากระบบแล้ว
+          </p>
+          <p style={{ fontSize: 14, opacity: 0.7, margin: 0 }}>
+            ท่านสามารถปิดหน้าต่างนี้ได้
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="voiceRoom"
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'minmax(360px, 0.78fr) minmax(540px, 1.22fr)',
+        alignItems: 'stretch',
+        justifyContent: 'center',
+        height: '100svh',
+        maxHeight: '100svh',
+        overflow: 'hidden',
+        background: '#f8fafc',
+        gap: 16,
+        padding: 16,
+        boxSizing: 'border-box',
+      }}
+    >
+      {needsAudioUnlock ? (
+        <button
+          type="button"
+          onClick={() => {
+            void roomRef.current?.startAudio().catch(() => {});
+            setNeedsAudioUnlock(false);
+          }}
+          style={{
+            position: 'fixed',
+            top: 16,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 50,
+            background: '#102a36',
+            color: '#ffffff',
+            border: 'none',
+            borderRadius: 999,
+            fontFamily: THAI_UI_FONT,
+            fontSize: 13,
+            padding: '8px 18px',
+            cursor: 'pointer',
+            boxShadow: '0 6px 20px rgba(16,42,54,0.25)',
+          }}
+        >
+          {'แตะเพื่อเปิดเสียงอารี'}
+        </button>
+      ) : null}
+      <section
+        className="botStage"
+        style={{
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 14,
+          alignItems: 'center',
+          justifyContent: 'center',
+          border: '1px solid rgba(62,163,203,0.24)',
+          borderRadius: 10,
+          background: 'radial-gradient(circle at 50% 42%, rgba(62,163,203,0.16), transparent 48%), #ecf7fb',
+          padding: '24px 18px',
+          boxSizing: 'border-box',
+          overflow: 'hidden',
+        }}
+      >
+        <div
+          className={[
+            'faceShell',
+            isAgentSpeaking ? 'faceShellSpeaking' : '',
+            isThinking ? 'faceShellThinking' : '',
+          ].join(' ')}
+        >
+          <LumoFace ref={faceRef} />
+        </div>
+        <p
+          style={{
+            color: '#25657c',
+            fontSize: 14,
+            opacity: 0.78,
+            margin: 0,
+            fontFamily: THAI_UI_FONT,
+            letterSpacing: 0,
+          }}
+        >
+          {micStatusLabel}
+        </p>
+        {micError ? (
+          <p
+            style={{
+              color: '#a4473f',
+              fontSize: 11,
+              lineHeight: 1.45,
+              margin: '-6px 0 0',
+              maxWidth: 260,
+              textAlign: 'center',
+              fontFamily: THAI_UI_FONT,
+              letterSpacing: 0,
+            }}
+          >
+            {micError}
+          </p>
+        ) : null}
+        {status === 'disconnected' ? (
+          <p
+            style={{
+              color: '#a4473f',
+              fontSize: 11,
+              lineHeight: 1.45,
+              margin: '-6px 0 0',
+              maxWidth: 260,
+              textAlign: 'center',
+              fontFamily: THAI_UI_FONT,
+              letterSpacing: 0,
+            }}
+          >
+            {'การเชื่อมต่อหลุด กรุณากดปุ่มด้านล่างเพื่อเชื่อมต่อใหม่'}
+          </p>
+        ) : null}
+        {showRetry ? (
+          <button
+            type="button"
+            onClick={handleRetryConnection}
+            style={{
+              border: '1.5px solid #3ea3cb',
+              background: '#ffffff',
+              color: '#1f6a84',
+              borderRadius: 999,
+              cursor: 'pointer',
+              fontFamily: THAI_UI_FONT,
+              fontSize: 12,
+              fontWeight: 800,
+              padding: '7px 16px',
+              marginTop: 2,
+            }}
+          >
+            {'ลองเชื่อมต่ออีกครั้ง'}
+          </button>
+        ) : null}
+        <button
+        type="button"
+        aria-label={interactionLabel}
+        disabled={!canTalk && !isTalking}
+        className={[
+          'talkButton',
+          isTalking ? 'talkButtonListening' : '',
+          isThinking ? 'talkButtonThinking' : '',
+          !micControlReady && !isTalking ? 'talkButtonDisabled' : '',
+        ].join(' ')}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          event.currentTarget.setPointerCapture(event.pointerId);
+          if (canTalk) void startTalking();
+        }}
+        onPointerUp={(event) => {
+          event.preventDefault();
+          if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+            event.currentTarget.releasePointerCapture(event.pointerId);
+          }
+          void stopTalking();
+        }}
+        onPointerCancel={stopTalking}
+        style={{
+          marginTop: 0,
+          width: 116,
+          height: 116,
+          // A flex item in a column shrinks by default, so on a short viewport the
+          // height collapsed (measured 116x40) while the width held — a 50% radius then
+          // renders an OVAL, not a circle. The media queries below size it down for
+          // small screens; this keeps it square at every size in between.
+          flexShrink: 0,
+          borderRadius: '50%',
+          border: '1.5px solid rgba(62, 163, 203, 0.24)',
+          background: isTalking ? '#3ea3cb' : micControlReady ? '#ffffff' : '#eef8fc',
+          color: isTalking ? '#ffffff' : micControlReady ? '#226b86' : 'rgba(37,101,124,0.42)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          cursor: micControlReady || isTalking ? 'pointer' : 'not-allowed',
+          userSelect: 'none',
+          touchAction: 'none',
+          position: 'relative',
+          boxShadow: isTalking
+            ? '0 12px 30px rgba(62, 163, 203, 0.36)'
+            : '0 10px 25px rgba(62, 163, 203, 0.12), inset 0 2px 4px #ffffff',
+          transition:
+            'transform 0.18s ease, background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease',
+        }}
+      >
+        <span
+          style={{
+            position: 'relative',
+            zIndex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <svg viewBox="0 0 24 24" width="38" height="38" strokeLinecap="round" strokeLinejoin="round">
+            <rect
+              x="9"
+              y="2"
+              width="6"
+              height="10"
+              rx="3"
+              fill={isTalking ? 'currentColor' : 'none'}
+              stroke="currentColor"
+              strokeWidth="2.2"
+            />
+            <path d="M5 10v1a7 7 0 0 0 14 0v-1" fill="none" stroke="currentColor" strokeWidth="2.2" />
+            <line x1="12" x2="12" y1="18" y2="22" fill="none" stroke="currentColor" strokeWidth="2.2" />
+            <line x1="9" x2="15" y1="22" y2="22" fill="none" stroke="currentColor" strokeWidth="2.2" />
+          </svg>
+        </span>
+        </button>
+        <p
+          className="talkCaption"
+          style={{
+            margin: '2px 0 0',
+            fontFamily: THAI_UI_FONT,
+            fontSize: 15,
+            fontWeight: 600,
+            letterSpacing: 0,
+            color: isTalking
+              ? '#226b86'
+              : micControlReady || isThinking || isAgentSpeaking
+                ? '#102a36'
+                : 'rgba(37,101,124,0.55)',
+            textAlign: 'center',
+          }}
+        >
+          {interactionLabel}
+        </p>
+        {showTalkHint ? (
+          <p
+            className="talkHint"
+            style={{
+              margin: '-4px 0 0',
+              fontFamily: THAI_UI_FONT,
+              fontSize: 12,
+              letterSpacing: 0,
+              color: '#25657c',
+              opacity: 0.7,
+              textAlign: 'center',
+            }}
+          >
+            {'กดปุ่มไมโครโฟนค้างไว้ หรือกดค้างที่ปุ่ม Spacebar แล้วพูด'}
+          </p>
+        ) : null}
+      </section>
+      <section
+        className="textStage"
+        style={{
+          minWidth: 0,
+          minHeight: 0,
+          height: '100%',
+          display: 'grid',
+          gridTemplateRows: SHOW_SESSION_HISTORY
+            ? 'minmax(0, 1fr) auto auto auto'
+            : 'minmax(0, 1fr) auto auto',
+          gap: 12,
+          overflow: 'hidden',
+        }}
+      >
+      <div
+        className="conversationGrid"
+        style={{
+          width: '100%',
+          minWidth: 0,
+          minHeight: 0,
+          height: '100%',
+          display: 'grid',
+          gridTemplateColumns: 'minmax(0, 1fr)',
+          gap: 0,
+          alignItems: 'stretch',
+          overflow: 'hidden',
+          transition: 'grid-template-columns 0.28s ease',
+        }}
+      >
+        <div
+          className={[
+            'answerPanel',
+            'detailPanel',
+            detailPreview ? 'answerPanelActive' : '',
+            isPreparingDetail ? 'answerPanelLoading' : '',
+          ].join(' ')}
+          style={{
+            border: '1px solid rgba(62,163,203,0.24)',
+            borderRadius: 8,
+            background: '#ffffff',
+            color: '#102a36',
+            fontFamily:
+              'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+            fontSize: 15,
+            lineHeight: 1.68,
+            padding: 18,
+            boxSizing: 'border-box',
+            minHeight: 0,
+            maxHeight: 'none',
+            height: '100%',
+            overflow: 'hidden',
+            position: 'relative',
+            display: 'grid',
+            gridTemplateRows: 'auto minmax(0, 1fr)',
+            transition:
+              'border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease, max-height 0.28s ease',
+          }}
+        >
+          <>
+              <div
+                style={{
+                  display: 'grid',
+                  gridTemplateColumns: 'minmax(0, 1fr) auto',
+                  gap: 8,
+                  marginBottom: 14,
+                  padding: '10px 12px',
+                  borderRadius: 7,
+                  background: 'rgba(241,249,252,0.96)',
+                  border: '1px solid rgba(62,163,203,0.18)',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                  <span
+                    style={{
+                      color: '#1f6a84',
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 14,
+                      fontWeight: 700,
+                      letterSpacing: 0,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {'รายละเอียดคำตอบ'}
+                  </span>
+                  <div
+                    className="detailTags"
+                    style={{
+                      display: 'flex',
+                      gap: 5,
+                      overflow: 'hidden',
+                    }}
+                  >
+                    {tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="detailTag"
+                        style={{
+                          border: '1px solid rgba(62,163,203,0.42)',
+                          borderRadius: 999,
+                          background: '#e8f6fb',
+                          color: '#226b86',
+                          fontFamily: THAI_UI_FONT,
+                          fontSize: 12,
+                          fontWeight: 700,
+                          letterSpacing: 0,
+                          padding: '3px 7px',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div
+                  style={{
+                    gridColumn: '2',
+                    gridRow: '1 / span 2',
+                    alignSelf: 'center',
+                    justifySelf: 'end',
+                    display: 'flex',
+                    gap: 6,
+                    alignItems: 'center',
+                  }}
+                >
+                <button
+                  type="button"
+                  onClick={openReport}
+                  title="แจ้งปัญหาที่พบตอนนี้"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    minWidth: 32,
+                    height: 24,
+                    borderRadius: 999,
+                    border: '1.5px solid rgba(164,71,63,0.42)',
+                    background: '#ffffff',
+                    color: '#a4473f',
+                    fontFamily: THAI_UI_FONT,
+                    fontSize: 10,
+                    fontWeight: 800,
+                    letterSpacing: '0.04em',
+                    padding: '0 10px',
+                    cursor: 'pointer',
+                    transition: 'all 0.2s ease',
+                  }}
+                >
+                  แจ้งปัญหา
+                </button>
+                <a
+                  href="https://forms.gle/ye4UyBRfHEncrsFW7"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    display: 'flex',
+                    background: '#eef8fc',
+                    border: '1.5px solid rgba(62,163,203,0.36)',
+                    borderRadius: 999,
+                    padding: 2,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                    textDecoration: 'none',
+                  }}
+                  title="แบบประเมินความพึงพอใจ"
+                >
+                  <span
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      minWidth: 32,
+                      height: 24,
+                      borderRadius: 999,
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 10,
+                      fontWeight: 800,
+                      letterSpacing: '0.04em',
+                      background: '#3ea3cb',
+                      color: '#ffffff',
+                      transition: 'all 0.2s ease',
+                      padding: '0 8px',
+                    }}
+                  >
+                    แบบประเมิน
+                  </span>
+                </a>
+                <div
+                  style={{
+                    display: 'flex',
+                    background: '#eef8fc',
+                    border: '1.5px solid rgba(62,163,203,0.36)',
+                    borderRadius: 999,
+                    padding: 2,
+                    cursor: 'pointer',
+                    userSelect: 'none',
+                  }}
+                  onClick={() => void handleLogout()}
+                  title="ออกจากระบบ"
+                >
+                  <span
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      minWidth: 32,
+                      height: 24,
+                      borderRadius: 999,
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 10,
+                      fontWeight: 800,
+                      letterSpacing: '0.04em',
+                      background: '#3ea3cb',
+                      color: '#ffffff',
+                      transition: 'all 0.2s ease',
+                      padding: '0 8px',
+                    }}
+                  >
+                    ออกจากระบบ
+                  </span>
+                </div>
+                </div>
+                {currentUserText ? (
+                  <div
+                    style={{
+                      gridColumn: '1',
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      minWidth: 0,
+                      fontFamily: THAI_UI_FONT,
+                    }}
+                  >
+                    <span
+                      style={{
+                        color: 'rgba(37,101,124,0.58)',
+                        fontSize: 13,
+                        fontWeight: 700,
+                        letterSpacing: 0,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {'คำถาม'}
+                    </span>
+                    <span
+                      style={{
+                        minWidth: 0,
+                        color: '#123b4a',
+                        fontSize: 13,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {cleanPreviewText(currentUserText)}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+              <div
+                className="detailScrollArea"
+                style={{
+                  minHeight: 0,
+                  overflowY: 'auto',
+                  paddingRight: 4,
+                }}
+              >
+                {detailPreview ? (
+                  <div
+                    className={[
+                      'detailCard',
+                      isPreparingDetail ? 'detailCardLoading' : '',
+                    ].join(' ')}
+                    style={{
+                      borderRadius: 8,
+                      background: '#eef8fc',
+                      color: '#102a36',
+                      padding: '18px 22px',
+                      fontSize: 16,
+                      lineHeight: 1.62,
+                      minHeight: 0,
+                      overflowWrap: 'break-word',
+                      position: 'relative',
+                    }}
+                    onMouseEnter={() => setAnswerHovered(true)}
+                    onMouseLeave={() => setAnswerHovered(false)}
+                  >
+                    {renderMarkdownPreview(detailPreview, currentUserText)}
+                    {(answerHovered || copiedAnswer) && !isPreparingDetail ? (
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          const ok = await copyTextToClipboard(detailPreview);
+                          if (!ok) return;
+                          setCopiedAnswer(true);
+                          setTimeout(() => setCopiedAnswer(false), 1500);
+                        }}
+                        style={{
+                          position: 'absolute',
+                          bottom: 10,
+                          right: 10,
+                          border: '1px solid',
+                          borderColor: copiedAnswer ? 'rgba(34,163,100,0.5)' : 'rgba(62,163,203,0.36)',
+                          borderRadius: 6,
+                          background: copiedAnswer ? '#d4f5e2' : 'rgba(255,255,255,0.92)',
+                          color: copiedAnswer ? '#22a364' : '#226b86',
+                          cursor: 'pointer',
+                          fontFamily: THAI_UI_FONT,
+                          fontSize: 11,
+                          fontWeight: 700,
+                          padding: '4px 10px',
+                          transition: 'all 0.2s ease',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          boxShadow: '0 1px 4px rgba(0,0,0,0.08)',
+                        }}
+                      >
+                        {copiedAnswer ? '✓ คัดลอกแล้ว' : '⧉ คัดลอก'}
+                      </button>
+                    ) : null}
+                    {sources.length > 0 && !isPreparingDetail ? (
+                      <div
+                        style={{
+                          marginTop: 16,
+                          paddingTop: 12,
+                          borderTop: '1px solid rgba(62,163,203,0.28)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          flexWrap: 'wrap',
+                          gap: 6,
+                          fontFamily: THAI_UI_FONT,
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 11.5,
+                            fontWeight: 700,
+                            color: 'rgba(37,101,124,0.66)',
+                            marginRight: 2,
+                          }}
+                        >
+                          {'ที่มา'}
+                        </span>
+                        {sources.map((source) => (
+                          <span
+                            key={source.n}
+                            style={{ position: 'relative', display: 'inline-flex' }}
+                            onMouseEnter={() => setOpenSource(source.n)}
+                            onMouseLeave={() => setOpenSource(null)}
+                          >
+                            <button
+                              type="button"
+                              aria-label={`แหล่งที่มา ${source.n}: ${source.title}`}
+                              aria-expanded={openSource === source.n}
+                              onClick={() =>
+                                setOpenSource(openSource === source.n ? null : source.n)
+                              }
+                              onFocus={() => setOpenSource(source.n)}
+                              onBlur={() => setOpenSource(null)}
+                              style={{
+                                minWidth: 22,
+                                height: 22,
+                                borderRadius: 6,
+                                border: '1px solid rgba(62,163,203,0.5)',
+                                background:
+                                  openSource === source.n ? '#3ea3cb' : 'rgba(255,255,255,0.92)',
+                                color: openSource === source.n ? '#ffffff' : '#226b86',
+                                fontFamily: THAI_UI_FONT,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                cursor: 'pointer',
+                                padding: '0 5px',
+                                transition: 'all 0.15s ease',
+                              }}
+                            >
+                              {source.n}
+                            </button>
+                            {openSource === source.n ? (
+                              <span
+                                role="tooltip"
+                                style={{
+                                  position: 'absolute',
+                                  bottom: 'calc(100% + 8px)',
+                                  left: 0,
+                                  zIndex: 20,
+                                  width: 320,
+                                  maxWidth: '78vw',
+                                  background: '#ffffff',
+                                  border: '1px solid rgba(62,163,203,0.42)',
+                                  borderRadius: 8,
+                                  boxShadow: '0 6px 20px rgba(16,42,54,0.16)',
+                                  padding: '12px 14px',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 7,
+                                  textAlign: 'left',
+                                  cursor: 'default',
+                                }}
+                              >
+                                <span
+                                  style={{
+                                    fontSize: 12.5,
+                                    fontWeight: 800,
+                                    color: '#123b4a',
+                                    lineHeight: 1.4,
+                                  }}
+                                >
+                                  {source.title}
+                                </span>
+                                <span
+                                  style={{
+                                    fontSize: 10.5,
+                                    color: 'rgba(37,101,124,0.72)',
+                                    letterSpacing: 0.2,
+                                  }}
+                                >
+                                  {[source.domain, source.subdomain, source.cluster_id]
+                                    .filter(Boolean)
+                                    .join(' · ')}
+                                </span>
+                                {source.outdated ? (
+                                  <span
+                                    style={{
+                                      fontSize: 10.5,
+                                      color: '#a4473f',
+                                      background: '#f8e9e7',
+                                      borderRadius: 4,
+                                      padding: '3px 7px',
+                                      lineHeight: 1.4,
+                                    }}
+                                  >
+                                    {'ข้อมูลนี้อาจไม่เป็นปัจจุบัน โปรดตรวจสอบกับกรมสรรพากร'}
+                                  </span>
+                                ) : null}
+                                <span
+                                  style={{
+                                    fontSize: 12,
+                                    color: '#254a58',
+                                    lineHeight: 1.55,
+                                    maxHeight: 168,
+                                    overflowY: 'auto',
+                                  }}
+                                >
+                                  {source.excerpt}
+                                </span>
+                                {source.url ? (
+                                  <a
+                                    href={source.url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={{
+                                      fontSize: 11,
+                                      color: '#1f6a84',
+                                      wordBreak: 'break-all',
+                                    }}
+                                  >
+                                    {source.url}
+                                  </a>
+                                ) : null}
+                              </span>
+                            ) : null}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div
+                    style={{
+                      color: 'rgba(37,101,124,0.45)',
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 15,
+                      letterSpacing: 0,
+                      padding: '24px 2px',
+                    }}
+                  >
+                    {'รอรายละเอียดคำตอบ'}
+                  </div>
+                )}
+              </div>
+          </>
+        </div>
+      </div>
+      {SHOW_SESSION_HISTORY ? (
+        <div
+          className="sessionHistoryPanel"
+          style={{
+            border: '1px solid rgba(62,163,203,0.24)',
+            borderRadius: 8,
+            background: '#f8fdff',
+            minHeight: 0,
+            maxHeight: sessionHistoryOpen ? 230 : 42,
+            overflow: 'hidden',
+            display: 'grid',
+            gridTemplateRows: sessionHistoryOpen ? 'auto minmax(0, 1fr)' : 'auto',
+            fontFamily: THAI_UI_FONT,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              gap: 10,
+              padding: '8px 12px',
+              borderBottom: '1px solid rgba(62,163,203,0.18)',
+              color: '#1f6a84',
+              fontSize: 12,
+              fontWeight: 800,
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setSessionHistoryOpen((open) => !open)}
+              style={{
+                border: 'none',
+                background: 'transparent',
+                color: '#1f6a84',
+                cursor: 'pointer',
+                fontFamily: THAI_UI_FONT,
+                fontSize: 12,
+                fontWeight: 800,
+                padding: 0,
+                display: 'flex',
+                gap: 8,
+                alignItems: 'center',
+              }}
+            >
+              <span>{sessionHistoryOpen ? '▾' : '▸'}</span>
+              <span>{'ประวัติคำถามในรอบนี้'}</span>
+              <span style={{ opacity: 0.62 }}>({sessionHistory.length})</span>
+            </button>
+            {sessionHistoryOpen && sessionHistory.length ? (
+              <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    const text = sessionHistory.map((entry) => {
+                      const parts: string[] = [`[${entry.time}]`];
+                      if (entry.question) parts.push(`ถาม: ${entry.question}`);
+                      if (entry.voiceAnswer) parts.push(`บอทพูด: ${entry.voiceAnswer}`);
+                      if (entry.detailAnswer) parts.push(`รายละเอียด:\n${entry.detailAnswer}`);
+                      return parts.join('\n');
+                    }).join('\n\n---\n\n');
+                    const ok = await copyTextToClipboard(text);
+                    if (!ok) return;
+                    setCopiedHistoryId('__all__');
+                    setTimeout(() => setCopiedHistoryId((prev) => prev === '__all__' ? null : prev), 1500);
+                  }}
+                  style={{
+                    border: '1px solid rgba(62,163,203,0.26)',
+                    borderRadius: 999,
+                    background: copiedHistoryId === '__all__' ? '#d4f5e2' : '#ffffff',
+                    color: copiedHistoryId === '__all__' ? '#22a364' : '#1f6a84',
+                    cursor: 'pointer',
+                    fontFamily: THAI_UI_FONT,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: '3px 9px',
+                    transition: 'all 0.2s ease',
+                  }}
+                >
+                  {copiedHistoryId === '__all__' ? '✓ คัดลอกแล้ว' : 'คัดลอกทั้งหมด'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    activeHistoryIdRef.current = '';
+                    setSessionHistory([]);
+                  }}
+                  style={{
+                    border: '1px solid rgba(62,163,203,0.26)',
+                    borderRadius: 999,
+                    background: '#ffffff',
+                    color: '#1f6a84',
+                    cursor: 'pointer',
+                    fontFamily: THAI_UI_FONT,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: '3px 9px',
+                  }}
+                >
+                  ล้าง
+                </button>
+              </div>
+            ) : null}
+          </div>
+          {sessionHistoryOpen ? (
+            <div
+              style={{
+                overflowY: 'auto',
+                padding: '8px 12px',
+                display: 'grid',
+                gap: 6,
+              }}
+            >
+              {sessionHistory.length ? (
+                sessionHistory.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="sessionHistoryEntry"
+                    style={{
+                      borderRadius: 6,
+                      background: '#ffffff',
+                      border: '1px solid rgba(62,163,203,0.16)',
+                      padding: '9px 10px',
+                      color: '#102a36',
+                      fontSize: 12.5,
+                      lineHeight: 1.45,
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: 'flex',
+                        gap: 8,
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                        color: '#226b86',
+                        fontSize: 11,
+                        fontWeight: 800,
+                        marginBottom: 3,
+                      }}
+                    >
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <span>{entry.time}</span>
+                        <span>{'คำถามและคำตอบ'}</span>
+                      </div>
+                      {(entry.voiceAnswer || entry.detailAnswer) ? (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const parts: string[] = [];
+                            if (entry.question) parts.push(`ถาม: ${entry.question}`);
+                            if (entry.voiceAnswer) parts.push(`บอทพูด: ${entry.voiceAnswer}`);
+                            if (entry.detailAnswer) parts.push(`รายละเอียด:\n${entry.detailAnswer}`);
+                            const ok = await copyTextToClipboard(parts.join('\n'));
+                            if (!ok) return;
+                            setCopiedHistoryId(entry.id);
+                            setTimeout(() => setCopiedHistoryId((prev) => prev === entry.id ? null : prev), 1500);
+                          }}
+                          style={{
+                            border: '1px solid',
+                            borderColor: copiedHistoryId === entry.id ? 'rgba(34,163,100,0.5)' : 'rgba(62,163,203,0.36)',
+                            borderRadius: 999,
+                            background: copiedHistoryId === entry.id ? '#d4f5e2' : '#ffffff',
+                            color: copiedHistoryId === entry.id ? '#22a364' : '#226b86',
+                            cursor: 'pointer',
+                            fontFamily: THAI_UI_FONT,
+                            fontSize: 10,
+                            fontWeight: 700,
+                            padding: '2px 8px',
+                            transition: 'all 0.2s ease',
+                            flexShrink: 0,
+                          }}
+                        >
+                          {copiedHistoryId === entry.id ? '✓ คัดลอกแล้ว' : 'คัดลอก'}
+                        </button>
+                      ) : null}
+                    </div>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gap: 6,
+                        overflowWrap: 'break-word',
+                      }}
+                    >
+                      <div style={{ whiteSpace: 'pre-wrap' }}>
+                        <strong style={{ color: '#226b86' }}>
+                          {'ถาม: '}
+                        </strong>
+                        {entry.question}
+                      </div>
+                      {entry.voiceAnswer ? (
+                        <div style={{ whiteSpace: 'pre-wrap' }}>
+                          <strong style={{ color: '#226b86' }}>
+                            {'บอทพูด: '}
+                          </strong>
+                          {entry.voiceAnswer}
+                        </div>
+                      ) : null}
+                      {entry.detailAnswer ? (
+                        <div>
+                          <strong style={{ color: '#226b86' }}>
+                            {'รายละเอียด: '}
+                          </strong>
+                          <div
+                            style={{
+                              marginTop: 5,
+                              display: 'grid',
+                              gap: 8,
+                            }}
+                          >
+                            {renderMarkdownPreview(entry.detailAnswer, entry.question)}
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div
+                  style={{
+                    color: 'rgba(37,101,124,0.52)',
+                    fontSize: 12.5,
+                    padding: '6px 0',
+                  }}
+                >
+                  {'ยังไม่มีประวัติในรอบนี้'}
+                </div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {pendingQueue.length > 0 && (
+        <div
+          style={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: 6,
+            padding: '6px 8px',
+            background: '#eef8fc',
+            borderTop: '1px solid rgba(62,163,203,0.25)',
+          }}
+        >
+          {pendingQueue.map((item, idx) => (
+            <div
+              key={idx}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 4,
+                background: '#ffffff',
+                border: '1px solid rgba(62,163,203,0.46)',
+                borderRadius: 14,
+                padding: '3px 10px',
+                fontFamily: THAI_UI_FONT,
+                fontSize: 12.5,
+                color: '#102a36',
+                maxWidth: 240,
+              }}
+            >
+              <span style={{ color: '#3ea3cb', flexShrink: 0 }}>⏳</span>
+              <span
+                style={{
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+                title={item}
+              >
+                {item.length > 40 ? item.slice(0, 38) + '…' : item}
+              </span>
+              <button
+                onClick={() => {
+                  setPendingQueue((q) => q.filter((_, i) => i !== idx));
+                }}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  color: '#888',
+                  padding: '0 2px',
+                  fontSize: 13,
+                  lineHeight: 1,
+                  flexShrink: 0,
+                }}
+                title={'ลบออกจากคิว'}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div
+        className="inputBar"
+        style={{
+          display: 'flex',
+          width: '100%',
+          gap: 0,
+          minHeight: 52,
+        }}
+      >
+        <input
+          type="text"
+          value={textInput}
+          placeholder={
+            willQueue
+              ? 'พิมพ์คำถามถัดไป (จะส่งเมื่ออารีพูดจบ)...'
+              : 'พิมพ์คำถามที่นี่...'
+          }
+          disabled={!textControlReady}
+          onChange={(e) => setTextInput(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && status === 'connected') {
+              submitQuestion(textInput);
+              setTextInput('');
+            }
+          }}
+          style={{
+            flex: 1,
+            background: '#ffffff',
+            color: '#102a36',
+            borderTop: '1.5px solid rgba(62,163,203,0.46)',
+            borderBottom: '1.5px solid rgba(62,163,203,0.46)',
+            borderLeft: '1.5px solid rgba(62,163,203,0.46)',
+            borderRight: 'none',
+            borderRadius: '26px 0 0 26px',
+            fontFamily: THAI_UI_FONT,
+            fontSize: 15.5,
+            padding: '12px 18px',
+            outline: 'none',
+            cursor: textControlReady ? 'text' : 'not-allowed',
+            transition: 'border-color 0.2s ease',
+          }}
+        />
+        <button
+          disabled={!textControlReady}
+          onClick={() => {
+            submitQuestion(textInput);
+            setTextInput('');
+          }}
+          style={{
+            background: '#3ea3cb',
+            color: '#ffffff',
+            border: '1.5px solid #3ea3cb',
+            borderRadius: '0 26px 26px 0',
+            fontFamily: THAI_UI_FONT,
+            fontSize: 15.5,
+            fontWeight: 700,
+            letterSpacing: 0,
+            padding: '12px 24px',
+            cursor: textControlReady ? 'pointer' : 'not-allowed',
+            flexShrink: 0,
+            transition: 'background 0.2s ease, border-color 0.2s ease',
+          }}
+        >
+          {willQueue
+            ? 'เข้าคิว'
+            : 'ส่ง'}
+        </button>
+      </div>
+      <p
+        className="aiDisclaimer"
+        style={{
+          margin: '2px 0 0',
+          padding: '7px 12px',
+          borderRadius: 7,
+          background: 'rgba(255, 246, 224, 0.9)',
+          border: '1px solid rgba(214, 158, 46, 0.35)',
+          color: '#8a6410',
+          fontFamily: THAI_UI_FONT,
+          fontSize: 12,
+          lineHeight: 1.5,
+          letterSpacing: 0,
+          textAlign: 'center',
+        }}
+      >
+        {'⚠️ ข้อมูลนี้ประมวลผลโดยระบบ AI อาจคลาดเคลื่อนได้ โปรดตรวจสอบกับกรมสรรพากรอีกครั้งก่อนนำไปใช้'}
+      </p>
+      {reportOpen ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="แจ้งปัญหา"
+          onClick={() => setReportOpen(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            zIndex: 60,
+            background: 'rgba(16,42,54,0.42)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <div
+            onClick={(event) => event.stopPropagation()}
+            style={{
+              width: 'min(560px, 100%)',
+              maxHeight: '86vh',
+              overflowY: 'auto',
+              background: '#ffffff',
+              borderRadius: 14,
+              border: '1px solid rgba(62,163,203,0.36)',
+              boxShadow: '0 18px 48px rgba(16,42,54,0.24)',
+              padding: '22px 24px',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 16,
+              fontFamily: THAI_UI_FONT,
+              color: '#102a36',
+            }}
+          >
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <span style={{ fontSize: 17, fontWeight: 800 }}>{'แจ้งปัญหา'}</span>
+              <span style={{ fontSize: 12, color: 'rgba(37,101,124,0.8)', lineHeight: 1.5 }}>
+                {'แจ้งได้ทุกเมื่อ ไม่ต้องรอให้ตอบคำถามเสร็จ ข้อมูลนี้ใช้เพื่อปรับปรุงระบบเท่านั้น'}
+              </span>
+            </div>
+
+            {reportState === 'sent' ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+                <div
+                  style={{
+                    background: '#d4f5e2',
+                    border: '1px solid rgba(34,163,100,0.4)',
+                    borderRadius: 8,
+                    padding: '14px 16px',
+                    fontSize: 13.5,
+                    lineHeight: 1.6,
+                  }}
+                >
+                  {'ส่งเรื่องเรียบร้อยแล้ว ขอบคุณที่ช่วยแจ้งค่ะ'}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setReportOpen(false)}
+                  style={{
+                    alignSelf: 'flex-end',
+                    border: '1.5px solid #3ea3cb',
+                    background: '#3ea3cb',
+                    color: '#ffffff',
+                    borderRadius: 999,
+                    padding: '9px 22px',
+                    fontFamily: THAI_UI_FONT,
+                    fontSize: 13,
+                    fontWeight: 800,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {'ปิด'}
+                </button>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 700 }}>{'ประเภทปัญหา'}</span>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
+                    {REPORT_TYPES.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        onClick={() => setReportType(option.value)}
+                        style={{
+                          border: '1.5px solid',
+                          borderColor: reportType === option.value ? '#3ea3cb' : 'rgba(62,163,203,0.32)',
+                          background: reportType === option.value ? '#3ea3cb' : '#ffffff',
+                          color: reportType === option.value ? '#ffffff' : '#226b86',
+                          borderRadius: 999,
+                          padding: '6px 13px',
+                          fontFamily: THAI_UI_FONT,
+                          fontSize: 12,
+                          fontWeight: 700,
+                          cursor: 'pointer',
+                          transition: 'all 0.15s ease',
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 700 }}>{'รายละเอียด'}</span>
+                  <textarea
+                    value={reportMessage}
+                    onChange={(event) => setReportMessage(event.target.value.slice(0, REPORT_MAX_LEN))}
+                    rows={4}
+                    placeholder={'เกิดอะไรขึ้น เช่น ตัวเลขไม่ตรงกับที่เจ้าหน้าที่แจ้ง'}
+                    style={{
+                      resize: 'vertical',
+                      borderRadius: 8,
+                      border: '1.5px solid rgba(62,163,203,0.42)',
+                      padding: '10px 12px',
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 13.5,
+                      lineHeight: 1.6,
+                      color: '#102a36',
+                      outline: 'none',
+                    }}
+                  />
+                  <span style={{ fontSize: 11, color: 'rgba(37,101,124,0.62)', alignSelf: 'flex-end' }}>
+                    {`${reportMessage.length} / ${REPORT_MAX_LEN}`}
+                  </span>
+                </div>
+
+                {/* Consent by transparency: show exactly what leaves the browser,
+                    rather than burying it in a policy line. */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  <span style={{ fontSize: 12.5, fontWeight: 700 }}>{'ข้อมูลที่จะถูกส่งไปพร้อมกัน'}</span>
+                  <div
+                    style={{
+                      background: '#eef8fc',
+                      border: '1px solid rgba(62,163,203,0.26)',
+                      borderRadius: 8,
+                      padding: '11px 13px',
+                      fontSize: 12,
+                      lineHeight: 1.65,
+                      color: '#254a58',
+                      maxHeight: 170,
+                      overflowY: 'auto',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 5,
+                    }}
+                  >
+                    {reportedTurn ? (
+                      <>
+                        <span><b>{'คำถาม: '}</b>{reportedTurn.question || '—'}</span>
+                        <span>
+                          <b>{'คำตอบบนหน้าจอ: '}</b>
+                          {(reportedTurn.detailAnswer || '—').replace(/\s+/g, ' ').slice(0, 220)}
+                          {(reportedTurn.detailAnswer || '').length > 220 ? '…' : ''}
+                        </span>
+                      </>
+                    ) : (
+                      <span>{'ยังไม่มีคำถามในรอบนี้ — จะส่งเฉพาะสถานะระบบ'}</span>
+                    )}
+                    {sources.length ? (
+                      <span>
+                        <b>{'แหล่งข้อมูลที่ใช้: '}</b>
+                        {sources.map((source) => source.cluster_id || source.title).join(', ')}
+                      </span>
+                    ) : null}
+                    <span style={{ color: 'rgba(37,101,124,0.72)' }}>
+                      {`สถานะระบบ: ${status}${micErrorName ? ` · ไมโครโฟน ${micErrorName}` : ''}`}
+                    </span>
+                    <span style={{ color: 'rgba(37,101,124,0.72)' }}>
+                      {`คำถามก่อนหน้าที่แนบไปด้วย: ${Math.min(
+                        REPORT_PRECEDING_TURNS,
+                        Math.max(0, sessionHistory.length - 1),
+                      )} รายการ`}
+                    </span>
+                  </div>
+                </div>
+
+                {reportState === 'error' ? (
+                  <div
+                    style={{
+                      background: '#f8e9e7',
+                      border: '1px solid rgba(164,71,63,0.4)',
+                      borderRadius: 8,
+                      padding: '10px 13px',
+                      fontSize: 12.5,
+                      color: '#a4473f',
+                      lineHeight: 1.55,
+                    }}
+                  >
+                    {'ส่งไม่สำเร็จ กรุณาลองอีกครั้ง'}
+                  </div>
+                ) : null}
+
+                <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 9 }}>
+                  <button
+                    type="button"
+                    onClick={() => setReportOpen(false)}
+                    style={{
+                      border: '1.5px solid rgba(62,163,203,0.42)',
+                      background: '#ffffff',
+                      color: '#226b86',
+                      borderRadius: 999,
+                      padding: '9px 20px',
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {'ยกเลิก'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={submitReport}
+                    disabled={!reportMessage.trim() || reportState === 'sending'}
+                    style={{
+                      border: '1.5px solid #3ea3cb',
+                      background: !reportMessage.trim() || reportState === 'sending' ? 'rgba(62,163,203,0.45)' : '#3ea3cb',
+                      color: '#ffffff',
+                      borderRadius: 999,
+                      padding: '9px 24px',
+                      fontFamily: THAI_UI_FONT,
+                      fontSize: 13,
+                      fontWeight: 800,
+                      cursor: !reportMessage.trim() || reportState === 'sending' ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    {reportState === 'sending' ? 'กำลังส่ง...' : 'ส่งเรื่อง'}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      ) : null}
+
+      </section>
+      <style jsx global>{`
+        .faceShell {
+          width: min(720px, 92%);
+          transform: none;
+          transition: none;
+        }
+
+        /* botStage clips its overflow, so drop the secondary hint before the
+           mic button can be pushed out of view on short viewports. */
+        @media (max-height: 700px) {
+          .talkHint {
+            display: none;
+          }
+
+          /* Sized down rather than left to shrink: both dimensions together, so it
+             stays a circle. */
+          .talkButton {
+            width: 92px !important;
+            height: 92px !important;
+          }
+
+          /* The avatar is WIDTH-driven (min(720px, 92%)), so on a wide-but-short
+             window it renders ~520px tall and eats the whole column — measured 520px
+             inside a 600px viewport, pushing the mic button and caption out of the
+             clipped botStage. Capping it against viewport height is what actually
+             makes room; shrinking the button alone never did, which is why the button
+             was being squashed into an oval in the first place. */
+          .faceShell {
+            width: min(720px, 92%, 64svh) !important;
+          }
+        }
+
+        @media (max-height: 560px) {
+          .talkButton {
+            width: 76px !important;
+            height: 76px !important;
+          }
+
+          .faceShell {
+            width: min(720px, 92%, 56svh) !important;
+          }
+        }
+
+        .faceShellThinking {
+          filter: none;
+          animation: none;
+        }
+
+        .faceShellSpeaking {
+          filter: none;
+          animation: none;
+        }
+
+        .talkButton::before,
+        .talkButton::after {
+          content: '';
+          position: absolute;
+          inset: -8px;
+          border-radius: 999px;
+          border: 1px solid rgba(62, 163, 203, 0.36);
+          opacity: 0;
+          pointer-events: none;
+        }
+
+        .talkButton:hover {
+          transform: translateY(-1px) scale(1.015);
+          box-shadow: 0 0 22px rgba(62, 163, 203, 0.22);
+        }
+
+        .talkButtonListening {
+          transform: scale(0.96);
+          box-shadow: 0 0 32px rgba(62, 163, 203, 0.34);
+        }
+
+        .talkButtonListening::before,
+        .talkButtonListening::after {
+          animation: talkRing 1.1s ease-out infinite;
+          opacity: 1;
+        }
+
+        .talkButtonListening::after {
+          animation-delay: 0.42s;
+        }
+
+        .talkButtonThinking::before {
+          opacity: 1;
+          border-top-color: rgba(62, 163, 203, 0.95);
+          animation: thinkingRing 1.2s linear infinite;
+        }
+
+        .answerPanelActive {
+          border-color: rgba(62, 163, 203, 0.45) !important;
+          background: #f2fbfe !important;
+          animation: none;
+        }
+
+        .answerPanelLoading {
+          box-shadow: inset 0 0 0 1px rgba(62, 163, 203, 0.08);
+        }
+
+        .inputBar input:focus {
+          border-color: #3ea3cb !important;
+          box-shadow: 0 0 12px rgba(62, 163, 203, 0.22);
+        }
+
+        .inputBar button:hover:not(:disabled) {
+          background: #2b8cb4 !important;
+          border-color: #2b8cb4 !important;
+        }
+
+        .detailPanel {
+          overflow: hidden;
+        }
+
+        .detailScrollArea {
+          scrollbar-gutter: stable;
+        }
+
+        .detailCard,
+        .detailCard * {
+          color: #102a36 !important;
+        }
+
+        .detailCard table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+
+        .detailCard th,
+        .detailCard td {
+          border-bottom: 1px solid rgba(62, 163, 203, 0.28);
+          padding: 8px 10px;
+          text-align: left;
+          vertical-align: top;
+        }
+
+        .detailPanel::before {
+          content: none;
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          opacity: 0.18;
+          background:
+            linear-gradient(90deg, transparent, rgba(62, 163, 203, 0.12), transparent),
+            repeating-linear-gradient(
+              180deg,
+              rgba(62, 163, 203, 0.08) 0,
+              rgba(62, 163, 203, 0.08) 1px,
+              transparent 1px,
+              transparent 9px
+            );
+          transform: translateX(-120%);
+          animation: detailScan 2.9s ease-in-out infinite;
+        }
+
+        .detailTag {
+          animation: tagIn 260ms ease-out;
+        }
+
+        .messageBubble,
+        .detailCard {
+          animation: none;
+        }
+
+        .messageBubbleLoading,
+        .detailCardLoading {
+          position: relative;
+          overflow: hidden;
+        }
+
+        .messageBubbleLoading::after,
+        .detailCardLoading::after {
+          content: none;
+          position: absolute;
+          inset: 0;
+          transform: translateX(-100%);
+          background: linear-gradient(
+            90deg,
+            transparent,
+            rgba(62, 163, 203, 0.12),
+            transparent
+          );
+          animation: loadingSweep 1.35s ease-in-out infinite;
+          pointer-events: none;
+        }
+
+
+        @media (max-width: 900px) {
+          .voiceRoom {
+            grid-template-columns: 1fr !important;
+            grid-template-rows: minmax(160px, 0.42fr) minmax(0, 0.58fr) !important;
+            padding: 10px !important;
+            gap: 10px !important;
+          }
+
+          .botStage {
+            gap: 8px !important;
+            padding: 12px !important;
+          }
+
+          .talkHint {
+            display: none !important;
+          }
+
+          .talkCaption {
+            font-size: 13px !important;
+          }
+
+          .faceShell {
+            width: min(320px, 88%, 28svh) !important;
+          }
+
+          .talkButton {
+            width: 82px !important;
+            height: 82px !important;
+            font-size: 9px !important;
+          }
+
+          .conversationGrid {
+            grid-template-columns: 1fr !important;
+            grid-template-rows: minmax(0, 1fr) !important;
+          }
+
+          .aiDisclaimer {
+            font-size: 10.5px !important;
+            padding: 5px 8px !important;
+          }
+        }
+
+        @keyframes talkRing {
+          0% {
+            transform: scale(0.92);
+            opacity: 0.55;
+          }
+          100% {
+            transform: scale(1.22);
+            opacity: 0;
+          }
+        }
+
+        @keyframes thinkingRing {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+
+        @keyframes areeSpeakingPulse {
+          0%,
+          100% {
+            transform: scale(1);
+          }
+          50% {
+            transform: scale(1.025);
+          }
+        }
+
+        @keyframes areeThinkingFloat {
+          0%,
+          100% {
+            transform: translateY(0);
+          }
+          50% {
+            transform: translateY(-3px);
+          }
+        }
+
+        @keyframes panelWake {
+          0% {
+            box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+          }
+          45% {
+            box-shadow: 0 0 28px rgba(62, 163, 203, 0.12);
+          }
+          100% {
+            box-shadow: 0 0 0 rgba(255, 255, 255, 0);
+          }
+        }
+
+        @keyframes bubbleIn {
+          from {
+            opacity: 0;
+            transform: translateY(6px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        @keyframes detailScan {
+          0%,
+          58% {
+            transform: translateX(-120%);
+            opacity: 0;
+          }
+          72% {
+            opacity: 0.18;
+          }
+          100% {
+            transform: translateX(120%);
+            opacity: 0;
+          }
+        }
+
+        @keyframes tagIn {
+          from {
+            opacity: 0;
+            transform: translateY(3px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        @keyframes loadingSweep {
+          100% {
+            transform: translateX(100%);
+          }
+        }
+
+        @media (max-width: 780px) {
+          .voiceRoom {
+            padding-top: 12px !important;
+            justify-content: flex-start !important;
+          }
+
+          .faceShell {
+            width: min(300px, calc(100vw - 48px), 26svh);
+          }
+
+          .talkButton {
+            width: 78px !important;
+            height: 78px !important;
+            font-size: 8px !important;
+          }
+
+          .conversationGrid {
+            grid-template-columns: 1fr !important;
+          }
+
+          .detailPanel {
+            max-height: 420px !important;
+          }
+
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+          .faceShell,
+          .talkButton,
+          .talkButton::before,
+          .talkButton::after,
+          .answerPanelActive,
+          .messageBubble,
+          .detailCard,
+          .messageBubbleLoading::after,
+          .detailCardLoading::after,
+          .detailPanel::before,
+          .detailTag {
+            animation: none !important;
+            transition: none !important;
+          }
+        }
+      `}</style>
+    </div>
+  );
+}

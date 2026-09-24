@@ -1,0 +1,125 @@
+# Local demo stack — NOT for deployment.
+#
+# Differences from docker-compose.yml (which stays the deployment file):
+#   - does not load "docker container/.env.sso"  (no SSO config)
+#   - drops the RD internal extra_hosts (SSO / security portal IPs)
+#   - pins a throwaway SSO_SESSION_SECRET so a local session cookie can be
+#     minted offline with scripts/mint-local-session.mjs
+#
+# The app's auth gate (proxy.ts) is untouched and still enforced — you sign in
+# with a locally minted session cookie instead of going through the RD portal.
+#
+# Usage:
+#   node scripts/mint-local-session.mjs        # writes local-login/index.html
+#   docker compose -p nongaree-local -f docker-compose.local.yml up --build -d
+#   open http://localhost:3001                 # click to sign in
+#   docker compose -p nongaree-local -f docker-compose.local.yml down -v
+
+services:
+  # Serves the generated one-click login page. Cookies are scoped by domain, not
+  # port, so the cookie it sets is sent to the app on port 3000.
+  local-login:
+    image: busybox:1.37
+    command: httpd -f -p 80 -h /site
+    volumes:
+      - ./local-login:/site:ro
+    ports:
+      - "${LOCAL_LOGIN_PORT:-3001}:80"
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    ports:
+      # 8102 sits inside a Windows reserved range (8071-8170); 6333 is outside all of them.
+      # Only for poking at Qdrant from the host - web/agent use http://qdrant:6333 internally.
+      - "${LOCAL_QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  qdrant-restore:
+    image: curlimages/curl:8.11.1
+    depends_on:
+      - qdrant
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+      SNAPSHOT_PATH: /snapshots/thai_tax_kb.snapshot.tar.gz
+    volumes:
+      - ./docker container/qdrant/snapshots:/snapshots:ro
+      - ./docker container/qdrant/scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/restore-qdrant-snapshot.sh"]
+    restart: "no"
+
+  web:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile
+    image: nongaree-voicebot-web:local
+    env_file:
+      - ./docker container/.env
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Local-only signing secret. Never used by the deployed stack, so a cookie
+      # minted here is worthless against production.
+      SSO_SESSION_SECRET: local-demo-secret-not-for-production
+      APP_URL: http://localhost:${LOCAL_WEB_PORT:-3000}
+      # Keeps this stack out of the deployed agent's dispatch pool. MUST match the
+      # agent service below — if they differ, dispatch goes to a worker nobody
+      # serves and Aree silently never joins the room.
+      AGENT_NAME: ${LOCAL_AGENT_NAME:-nongaree-agent-local}
+      # Local-only admin token so the report endpoint can be exercised. The deployed
+      # stack must set its own value in `docker container/.env`; until it does, the
+      # endpoint stays disabled and answers 404.
+      REPORT_ADMIN_TOKEN: local-demo-admin-token-not-for-production
+    ports:
+      - "${LOCAL_WEB_PORT:-3000}:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    volumes:
+      # Problem reports (append-only JSONL, rotated monthly). A named volume so
+      # reports survive image rebuilds and a retention policy can be enforced by
+      # deleting a file rather than migrating rows.
+      - report_data:/data/reports
+      # Conversation memory (one JSON per user, 30-minute idle TTL, pruned lazily).
+      # Same file-backed approach as report_data and for the same reason: a database
+      # would add a service and an image to the prebuilt-release handoff.
+      # If this mount is absent the agent logs a warning once and falls back to
+      # in-process memory, i.e. previous behaviour — it does not crash.
+      - memory_data:/data/memory
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: .
+      dockerfile: docker container/Dockerfile.agent
+    image: nongaree-voicebot-agent:local
+    env_file:
+      - ./docker container/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-thai_tax_kb}
+      # MUST match the web service above.
+      AGENT_NAME: ${LOCAL_AGENT_NAME:-nongaree-agent-local}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      qdrant-restore:
+        condition: service_completed_successfully
+    volumes:
+      # Conversation memory (one JSON per user, 30-minute idle TTL, pruned lazily).
+      # Same file-backed approach as report_data and for the same reason: a database
+      # would add a service and an image to the prebuilt-release handoff.
+      # If this mount is absent the agent logs a warning once and falls back to
+      # in-process memory, i.e. previous behaviour — it does not crash.
+      - memory_data:/data/memory
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  report_data:
+  memory_data:

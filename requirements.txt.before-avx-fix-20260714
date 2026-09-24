@@ -1,0 +1,5 @@
+livekit-agents[openai,silero]>=0.12.0
+python-dotenv>=1.0.0
+langgraph
+langchain-openai
+qdrant-client
