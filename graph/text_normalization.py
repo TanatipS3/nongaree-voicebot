@@ -137,6 +137,13 @@ def normalize_phone_numbers_for_tts(text: str) -> str:
     def digits_only(match: re.Match[str]) -> str:
         return _spoken_digits(match.group(0))
 
+    # The generator writes phone numbers with a NON-BREAKING hyphen (U+2011) often enough
+    # to matter — seen on the executive-roster answers — and an en dash sometimes. Those
+    # miss the dashed rule below and the number is then read as an amount
+    # ("ศูนย์สอง-สองร้อยเจ็ดสิบสอง-แปดพันสองร้อยหกสิบเอ็ด"). Only dashes BETWEEN DIGITS are
+    # normalised, so an em dash in prose is left alone.
+    text = re.sub(r"(?<=\d)[‐-―−﹘﹣－](?=\d)", "-", text)
+
     # 02-272-8000, 081-234-5678, 02 272 8000 — a leading 0 makes this unambiguous.
     dashed = rf"(?<![0-9])0\d{{1,2}}[-\s]\d{{3}}[-\s]\d{{3,4}}(?![0-9]){_NOT_A_QUANTITY}"
     text = re.sub(dashed, digits_only, text)

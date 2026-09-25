@@ -67,7 +67,12 @@ writeFileSync(
 <script>
 document.getElementById('go').onclick = function () {
   document.cookie = 'nongaree_sso_session=${token}; path=/; max-age=${TTL_SECONDS}';
-  location.href = 'http://localhost:${WEB_PORT}/';
+  // Open the app in a script-opened tab rather than navigating this one: browsers only
+  // honour window.close() for tabs opened by script, so this is what lets logout close
+  // the tab locally. Falls back to same-tab navigation if a popup blocker refuses.
+  if (!window.open('http://localhost:${WEB_PORT}/', '_blank')) {
+    location.href = 'http://localhost:${WEB_PORT}/';
+  }
 };
 </script>
 `,
@@ -79,6 +84,7 @@ Local demo session ready (expires in 7 days).
 
   ->  Open http://localhost:${LOGIN_PORT}  and click the button.
 
-That sets the cookie and drops you into the app on port ${WEB_PORT}.
+That sets the cookie and opens the app on port ${WEB_PORT} in a new tab
+(so logout can close it).
 Wrote local-login/index.html
 `);

@@ -289,12 +289,10 @@ _FAST_RAG_KEYWORDS = (
     "ยื่นแบบ",
     "ยื่น",
     "ลดหย่อน",
-    "ลดหยอน",      # common misspelling (missing ่)
     "แวต",
     "vat",
     "ใบกำกับ",
     "สรรพากร",
-    "สรรพกร",      # common misspelling — without it "กรมสรรพกร…" lost its only keyword
     "ภงด",
     "ภ.ง.ด",
     "หัก ณ ที่จ่าย",
@@ -309,13 +307,7 @@ _FAST_RAG_KEYWORDS = (
     "เงินเพิ่ม",
     "บริจาค",
 )
-# "ชื่ออะไร" is NOT in this list any more: as a bare substring it caught every
-# "<someone> ชื่ออะไร" that lacked a tax keyword, so "อธิบอดีชื่ออะไร" was answered with
-# Aree's own name. Asking Aree her name is matched whole by _SELF_NAME_PATTERN instead.
-_FAST_DIRECT_KEYWORDS = ("สวัสดี", "หวัดดี", "สวสดี", "ขอบคุณ", "แนะนำตัว", "ทำอะไรได้บ้าง")
-_SELF_NAME_PATTERN = re.compile(
-    r"^(?:น้องอารี|อารี|คุณ|น้อง|หนู|เธอ|บอท)?ชื่ออะไร(?:คะ|ค่ะ|ครับ|จ๊ะ|จ้ะ|จ้า|นะ|เหรอ|หรอ)*[?？]*$"
-)
+_FAST_DIRECT_KEYWORDS = ("สวัสดี", "ขอบคุณ", "ชื่ออะไร", "แนะนำตัว", "ทำอะไรได้บ้าง")
 _FOLLOWUP_KEYWORDS = (
     "ใช่",
     "ครับ",
@@ -479,14 +471,11 @@ def _fast_route(query: str) -> str | None:
         return "rag"
     if any(keyword in normalized for keyword in _FAST_DIRECT_KEYWORDS):
         return "direct"
-    if _SELF_NAME_PATTERN.match(re.sub(r"\s+", "", normalized)):
-        return "direct"
-    # NOTE: this is a fallthrough, not a decision. It means "no rag / direct keyword
-    # matched", which covers BOTH a genuinely off-topic question and a real question
-    # phrased outside the lists ("อธิบดี", "สายด่วน", "เวลาทำการ"). parallel_node() therefore
-    # searches the knowledge base before refusing (_should_search_before_refusing), and
-    # out_of_scope_node() words its refusal to be honest either way. Do not treat this as
-    # proof the question is off topic.
+    # NOTE: this is a fallthrough, not a decision. It means "none of the 33 rag / 5
+    # direct keywords matched", which covers BOTH a genuinely off-topic question and a
+    # real tax question phrased outside the lists. out_of_scope_node() therefore words
+    # its non-LLM answer to be honest either way. Do not treat this as proof the
+    # question is off topic.
     return "out_of_scope"
 
 
@@ -892,25 +881,6 @@ def _should_classify_followup(query: str, messages: list, fast_route: str) -> bo
     return not _is_provider_recommendation(query)
 
 
-def _should_search_before_refusing(query: str) -> bool:
-    """Search the KB on a keyword miss instead of refusing outright (search-first).
-
-    The keyword lists cannot name everything the corpus covers — executives, the call
-    centre, office hours — so a miss used to refuse questions whose answers were sitting
-    in the KB ("อธิบดี", "รองอธิบดี", "สายด่วน", "เวลาทำการ"). The score gate in
-    retrieve_with_sources still decides whether anything is good enough; measured on 8
-    off-topic questions (weather, minimum wage, marriage, the PM, restaurants, passports,
-    condos) none got past it.
-
-    Never for a provider recommendation ("ธนาคารไหนดีที่สุด") — that is a decision, not a
-    fallthrough, and it retrieves above the gate. OUT_OF_SCOPE_SEARCH=false is the
-    rollback switch.
-    """
-    if os.getenv("OUT_OF_SCOPE_SEARCH", "true").lower() != "true":
-        return False
-    return not _is_provider_recommendation(query)
-
-
 async def classify_followup(query: str, messages: list) -> bool | None:
     """True/False from the LLM, or None on timeout / error / unparseable output."""
     recent = [
@@ -927,10 +897,7 @@ async def classify_followup(query: str, messages: list) -> bool | None:
         lines.append(f"{'ผู้ใช้' if is_user else 'อารี'}: {text}")
     prompt = FOLLOWUP_CLASSIFIER_PROMPT.format(history="\n".join(lines), query=query.strip())
 
-    # 4.0, was 2.5: measured 2026-09-25 the classifier took 1.5–2.85 s (first call slowest),
-    # so 2.5 s timed out `unlisted_followups` t5 on every harness run and the follow-up fell
-    # back to keywords. It only runs on keyword misses mid-conversation.
-    timeout_s = float(os.getenv("FOLLOWUP_CLASSIFIER_TIMEOUT_S", "4.0") or "4.0")
+    timeout_s = float(os.getenv("FOLLOWUP_CLASSIFIER_TIMEOUT_S", "2.5") or "2.5")
     started = time.perf_counter()
     try:
         response = await asyncio.wait_for(
@@ -1099,21 +1066,6 @@ async def parallel_node(state: AgentState) -> dict:
             router_start = time.perf_counter()
             tracker.router_start = router_start
             tracker.router_done = router_start
-            if _should_search_before_refusing(state["query"]):
-                # The user's OWN words only: with messages=[] the retrieval cascade has
-                # no opener / previous-answer candidate to borrow tax vocabulary from.
-                # A mid-conversation "วันนี้อากาศเป็นยังไง" must not ride the opener past
-                # the score gate. Real follow-ups were already rescued above by the
-                # keyword rescue or the LLM classifier.
-                retrieve_result = await retrieve_node({**state, "messages": []})
-                if (retrieve_result["context"] or "").strip():
-                    return {
-                        "route": "rag",
-                        "context": retrieve_result["context"],
-                        "sources": retrieve_result.get("sources", []),
-                    }
-            # Nothing usable: the conditional out_of_scope wording, NOT NO_SOURCE_ANSWER's
-            # staff-handoff table — the question may well be the weather.
             return {"route": "out_of_scope", "context": ""}
 
         router_task = asyncio.create_task(router_node(state))

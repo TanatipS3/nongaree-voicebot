@@ -514,88 +514,6 @@ def test_no_fabrication_rule_parity():
           "ยังไม่มีข้อมูล" in examples and "1161" in examples, "")
 
 
-# --- routing: search-first on a keyword miss ---------------------------------------
-
-async def test_search_first_routing():
-    """A keyword miss searches the KB before refusing — with the user's own words only.
-
-    2026-09-25, measured on the server: "อธิบดี", "รองอธิบดี", "สายด่วน", "เวลาทำการ" were all
-    refused as out_of_scope without a search although the KB holds the answers; routing the
-    same questions to search-first answered them and let none of 8 off-topic questions through.
-    Retrieval is faked here, so this stays offline.
-    """
-    from graph import nodes
-
-    calls = []
-
-    async def fake_retrieve(state):
-        calls.append(state)
-        if "อธิบดี" in state["query"]:
-            return {"context": "ท่านอธิบดีกรมสรรพากร นายสมศักดิ์ อนันทวัฒน์",
-                    "sources": [{"n": 1, "record_id": "RD-EXEC"}]}
-        return {"context": "", "sources": []}
-
-    async def no_followup(query, messages):
-        return False
-
-    saved = (nodes.retrieve_node, nodes.classify_followup)
-    saved_env = {k: os.environ.pop(k, None) for k in ("OUT_OF_SCOPE_SEARCH", "ROUTER_USE_LLM", "RAG_ENABLED")}
-    nodes.retrieve_node, nodes.classify_followup = fake_retrieve, no_followup
-    history = [{"role": "user", "content": "เงินเดือน 30,000 ต้องเสียภาษีไหม"},
-               {"role": "assistant", "content": "ต้องยื่นแบบ ภ.ง.ด.91"}]
-
-    async def route(query, messages=()):
-        calls.clear()
-        return await nodes.parallel_node({"query": query, "messages": list(messages)})
-
-    try:
-        got = await route("อธิบดี")
-        check("search-first: keyword miss with a KB hit -> rag + sources",
-              got["route"] == "rag" and got.get("sources"), got)
-
-        got = await route("วันนี้อากาศเป็นยังไง")
-        check("search-first: keyword miss, nothing found -> soft out_of_scope (not the handoff table)",
-              got["route"] == "out_of_scope" and "answer" not in got and len(calls) == 1, got)
-
-        got = await route("วันนี้อากาศเป็นยังไง", history)
-        check("search-first: mid-conversation miss searches the user's own words only",
-              got["route"] == "out_of_scope" and calls and calls[0]["messages"] == [],
-              [c.get("messages") for c in calls])
-
-        got = await route("ธนาคารไหนดอกเบี้ยดีที่สุด")
-        check("search-first: provider recommendation never searches",
-              got["route"] == "out_of_scope" and not calls, (got, len(calls)))
-
-        got = await route("ภาษีเงินได้คืออะไร", history)
-        check("search-first: a keyword hit still retrieves with the conversation",
-              calls and calls[0]["messages"] == history, [c.get("messages") for c in calls])
-
-        os.environ["OUT_OF_SCOPE_SEARCH"] = "false"
-        got = await route("อธิบดี")
-        check("search-first: OUT_OF_SCOPE_SEARCH=false restores refuse-without-search",
-              got["route"] == "out_of_scope" and not calls, (got, len(calls)))
-    finally:
-        nodes.retrieve_node, nodes.classify_followup = saved
-        for k, v in saved_env.items():
-            os.environ.pop(k, None)
-            if v is not None:
-                os.environ[k] = v
-
-    # Keyword-level fixes from the same measurement.
-    fast = {q: nodes._fast_route(q) for q in (
-        "อธิบอดีชื่ออะไร", "อธิบดีชื่ออะไร", "ชื่ออะไร", "น้องอารีชื่ออะไรคะ", "คุณชื่ออะไรครับ",
-        "หวัดดีน้องอารี", "สวสดีครับ", "กรมสรรพกรสังกัดกระทรวงอะไร", "ลดหยอนได้เท่าไหร่",
-    )}
-    check("routing: '<someone> ชื่ออะไร' is not answered with Aree's own name",
-          fast["อธิบอดีชื่ออะไร"] == "out_of_scope" and fast["อธิบดีชื่ออะไร"] == "out_of_scope", fast)
-    check("routing: asking Aree her name is still a greeting",
-          all(fast[q] == "direct" for q in ("ชื่ออะไร", "น้องอารีชื่ออะไรคะ", "คุณชื่ออะไรครับ")), fast)
-    check("routing: greeting typos are greetings",
-          fast["หวัดดีน้องอารี"] == "direct" and fast["สวสดีครับ"] == "direct", fast)
-    check("routing: misspelt สรรพกร / ลดหยอน keep their keyword",
-          fast["กรมสรรพกรสังกัดกระทรวงอะไร"] == "rag" and fast["ลดหยอนได้เท่าไหร่"] == "rag", fast)
-
-
 async def main():
     await test_turn_recorder()
     await test_fact_pinning()
@@ -606,7 +524,6 @@ async def main():
     test_emotion_table_parity()
     test_phone_numbers_spoken_as_digits()
     test_no_fabrication_rule_parity()
-    await test_search_first_routing()
 
 
 asyncio.run(main())
