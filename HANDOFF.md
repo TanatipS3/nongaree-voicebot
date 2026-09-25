@@ -2643,8 +2643,12 @@ chunk — "อธิบดี" alone is ambiguous; not verified as current.
   all 5 roster points present, no stale name in any answer.
 - Tester complaints "Sign Out → SSO login page" / "sign in via RD SSO Portal shows the old
   SSO screen" are **not this app**: neither string exists in any version of the code nor in
-  the running `.next` bundle. Most likely the old ARI text chatbot behind
-  `ari-chatbot.rd.go.th`. Asked for the tester's URL + screenshot.
+  the running `.next` bundle. **Confirmed later the same day: they are the `docrd-deploy` app**
+  (document chat, rd30 port 8081, `/home/nectec/docrd-deploy`). Its Sign Out
+  (`frontend/components/KnowledgeView.tsx:698`) only removes the token and redirects to
+  `/login` — no SSO logout call — and its "Sign in via RD SSO Portal" button
+  (`Login.tsx:224`) is a plain link to securityportal.rd.go.th, whose session is still alive.
+  Its frontend container has run unchanged for 3 months. Not our code — for its owner.
 
 ### Fix 34 — search-first on a keyword miss (`graph/nodes.py`)
 
@@ -2721,6 +2725,47 @@ book e-Appointment, a general "how do I contact staff", "หัวหน้า�
 questions ("นายกฤดา…เป็นใคร"). "สายด่วน" retrieves the e-Withholding hotline rather than 1161.
 Fix = question-phrasing points, as `scripts/update_executive_kb.py` does — needs the user to
 confirm the facts.
+
+### Self-hosted RD speech (STT/TTS) — tried in production, ROLLED BACK the same day
+
+Servers on rd30 (another team's `pathumma-speech` images, on the A100s):
+`STT_BASE_URL=http://10.223.5.30:5173/v1` (`ptm-asr-1`), `TTS_BASE_URL=http://10.223.5.30:19100/v1`
+(`ptm-tts-1`), no API key (`none`). Measured: TTS returns 24 kHz mono s16 PCM (what WavTTS
+wants) and **requires `voice`** (422 without; `bantita` works); STT transcribed TTS output
+exactly in 0.1–0.5 s. **Neither serves `GET /v1/models` (404).**
+
+- **`agent.py` STT probe fixed:** `_build_stt_plugin()` used `raise_for_status()` on
+  `GET /models`, so the 404 silently switched server-side STT off. Now only 401/403/5xx count
+  as failure. Harmless with tokenmind. The running prod IMAGE has this fix; after the rollback
+  the server's `agent.py` ON DISK is the old one (`4e945eec…`) — a rebuild reverts it.
+- **`docker-compose.speech.yml`** (additive, delete to revert) points the LOCAL agent at these
+  servers. Verified locally with `scripts/e2e_voice_turn.py`: exact transcription, `route: rag`.
+- Deployed to prod 13:44 Thai (06:44 UTC), e2e voice PASS. **Rolled back at 14:19** on the
+  user's call, after **rd30's disk hit 100%**: the pathumma-speech team built ~48 GB of images
+  + ~28 GB build cache that day. A `cp` during the rollback truncated `agent.py` to 0 bytes;
+  restored with `mv` from the backup (rename needs no free space). `docker image prune -f`
+  freed our old untagged images → 8.9 GB free. Other teams' Postgres DBs were at risk at 0 B.
+
+**Trap — local agent-name collision.** With the repo shared, a co-worker's local stack also
+registers `nongaree-agent-local`; a local e2e test was answered by THEIR worker. Start the
+stack with a personal `LOCAL_AGENT_NAME` and confirm your container logged the `job_id`.
+
+### Real users on 2026-09-25 — what they hit
+
+Two users (TN371636 — its questions expired with the 30-min memory; SK194983). SK194983's
+stored conversation shows four problems, **none fixed yet**:
+1. **Spoken numbers:** "เงินเดือน**สามหมื่น**บาท ต้องเสียภาษีไหม" (the STT writes numbers as words)
+   → no-source refusal, while "30,000" gets the calculator. Every voice user who says an
+   amount hits this. Fix: Thai number words → digits before routing.
+2. "บริจาคได้สูงสุดกี่บาท" asked twice → refused (KB lacks the limit). User then wrote
+   "มันไม่มี… มันไม่รู้เรื่อง".
+3. "ถ้าลืมยื่นภาษีจะโดนปรับไหม" answered with a ≤7-day 100 / >7-day 200 บาท scale — possibly
+   the withholding-form scale, not ภ.ง.ด.90/91. **Unverified — needs an RD tax expert.**
+4. The stored **summary contains a leaked `<think>` block** from the 8B summariser, which is
+   then fed back into prompts. Fix: strip think tags in `summarize_history`.
+
+The agent log before 14:19 was lost when the container was recreated — `docker compose
+logs` covers the current container only. The web log (not recreated) still lists sessions.
 
 ---
 

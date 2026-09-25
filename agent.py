@@ -86,7 +86,13 @@ def _build_stt_plugin():
                 f"{base_url}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
-            response.raise_for_status()
+            # Any HTTP answer means the server is up. The self-hosted RD ASR
+            # (10.223.5.30:5173) implements only /audio/transcriptions and returns 404
+            # for /models, which raise_for_status() used to treat as "unreachable" —
+            # silently switching server-side STT off. Only a rejected key or a server
+            # error still counts as a failure.
+            if response.status_code in (401, 403) or response.status_code >= 500:
+                response.raise_for_status()
     except Exception:
         message = (
             "LiveKit STT endpoint is unreachable at %s; starting without server-side STT. "

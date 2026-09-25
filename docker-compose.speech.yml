@@ -1,0 +1,25 @@
+# TEST OVERRIDE — point the LOCAL agent at the self-hosted RD speech servers on rd30
+# instead of tokenmind. Purely additive: delete this file to revert.
+#
+#   docker compose -p nongaree-local \
+#     -f docker-compose.local.yml -f docker-compose.speech.yml up -d --force-recreate agent
+#
+# Needs the RD VPN. Verified 2026-09-25 from the dev PC:
+#   TTS  POST /v1/audio/speech         200, 24 kHz mono s16 PCM (what WavTTS expects);
+#        `voice` is REQUIRED (422 without it) — bantita works.
+#   STT  POST /v1/audio/transcriptions 200, transcribed the TTS output exactly.
+#   Neither serves GET /v1/models (404) — agent.py's STT probe was relaxed to accept that.
+# Neither needs an API key; "none" is sent because WavTTS / openai.STT require a value.
+#
+# Why a file rather than editing `docker container/.env`: that env file is on the
+# protected list (deployment). To make this permanent, change STT_/TTS_ there — ask first.
+
+services:
+  agent:
+    environment:
+      STT_BASE_URL: http://10.223.5.30:5173/v1
+      STT_API_KEY: none
+      STT_MODEL: ptm-asr-1
+      TTS_BASE_URL: http://10.223.5.30:19100/v1
+      TTS_API_KEY: none
+      TTS_MODEL: ptm-tts-1
